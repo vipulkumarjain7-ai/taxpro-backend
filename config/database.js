@@ -1,4 +1,4 @@
-    const Database = require("better-sqlite3");
+    const Database = require("@sqlite.org/sqlite-wasm");
 const path = require("path");
 
 const DB_PATH = process.env.DB_PATH || "./taxpro.db";
