@@ -44,6 +44,7 @@ app.use("/api/notices", require("./routes/notices"));
 app.use("/api/returns", require("./routes/returns"));
 app.use("/api/reconciliation", require("./routes/reconciliation"));
 app.use("/api/ai", require("./routes/ai"));
+app.use("/api/import", require("./routes/import"));
 // ── Health check ───────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({ success: true, message: "TaxPro GST API is running.", timestamp: new Date().toISOString() });
