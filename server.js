@@ -21,7 +21,6 @@ app.use(cors({
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
-app.use("/api/ai", require("./routes/ai"));
 // Rate limiter — 100 requests per 15 minutes per IP
 app.use("/api/", rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -37,13 +36,14 @@ app.use("/api/auth/login", rateLimit({
 }));
 
 // ── Routes ─────────────────────────────────────────────────────────────────
-app.use("/api/auth",            require("./routes/auth"));
-app.use("/api/dashboard",       require("./routes/dashboard"));
-app.use("/api/clients",         require("./routes/clients"));
-app.use("/api/notices",         require("./routes/notices"));
-app.use("/api/returns",         require("./routes/returns"));
-app.use("/api/reconciliation",  require("./routes/reconciliation"));
-
+app.set("trust proxy", 1);
+app.use("/api/auth", require("./routes/auth"));
+app.use("/api/dashboard", require("./routes/dashboard"));
+app.use("/api/clients", require("./routes/clients"));
+app.use("/api/notices", require("./routes/notices"));
+app.use("/api/returns", require("./routes/returns"));
+app.use("/api/reconciliation", require("./routes/reconciliation"));
+app.use("/api/ai", require("./routes/ai"));
 // ── Health check ───────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({ success: true, message: "TaxPro GST API is running.", timestamp: new Date().toISOString() });
