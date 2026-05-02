@@ -21,7 +21,7 @@ app.use(cors({
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
-
+app.use("/api/ai", require("./routes/ai"));
 // Rate limiter — 100 requests per 15 minutes per IP
 app.use("/api/", rateLimit({
   windowMs: 15 * 60 * 1000,
