@@ -1,7 +1,13 @@
-const returnsRouter = express.Router();
-returnsRouter.use(auth);
- 
-returnsRouter.get("/", async (req, res) => {
+const express = require("express");
+const { v4: uuid } = require("uuid");
+const { body, validationResult } = require("express-validator");
+const pool = require("../config/database");
+const auth = require("../middleware/auth");
+
+const router = express.Router();
+router.use(auth);
+
+router.get("/", async (req, res) => {
   try {
     const { period, client_id } = req.query;
     let query = "SELECT r.*, c.name as client_name, c.gstin FROM returns r JOIN clients c ON r.client_id=c.id WHERE r.user_id=$1";
@@ -13,8 +19,8 @@ returnsRouter.get("/", async (req, res) => {
     res.json({ success: true, count: result.rows.length, returns: result.rows });
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
- 
-returnsRouter.get("/summary", async (req, res) => {
+
+router.get("/summary", async (req, res) => {
   try {
     const { period } = req.query;
     if (!period) return res.status(400).json({ success: false, message: "Period required" });
@@ -32,8 +38,8 @@ returnsRouter.get("/summary", async (req, res) => {
     });
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
- 
-returnsRouter.post("/", [
+
+router.post("/", [
   body("client_id").notEmpty(),
   body("period").trim().notEmpty(),
   body("gstr1_status").isIn(["filed","pending","not-filed"]),
@@ -57,8 +63,8 @@ returnsRouter.post("/", [
     res.status(201).json({ success: true, message: "Return record created", return: rec.rows[0] });
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
- 
-returnsRouter.put("/:id", async (req, res) => {
+
+router.put("/:id", async (req, res) => {
   try {
     const r = await pool.query("SELECT id FROM returns WHERE id=$1 AND user_id=$2", [req.params.id, req.user.id]);
     if (!r.rows[0]) return res.status(404).json({ success: false, message: "Record not found" });
@@ -71,8 +77,8 @@ returnsRouter.put("/:id", async (req, res) => {
     res.json({ success: true, message: "Return updated", return: updated.rows[0] });
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
- 
-returnsRouter.delete("/:id", async (req, res) => {
+
+router.delete("/:id", async (req, res) => {
   try {
     const r = await pool.query("SELECT id FROM returns WHERE id=$1 AND user_id=$2", [req.params.id, req.user.id]);
     if (!r.rows[0]) return res.status(404).json({ success: false, message: "Record not found" });
@@ -80,5 +86,5 @@ returnsRouter.delete("/:id", async (req, res) => {
     res.json({ success: true, message: "Record deleted" });
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
- 
-module.exports.returnsRouter = returnsRouter;
+
+module.exports = router;
