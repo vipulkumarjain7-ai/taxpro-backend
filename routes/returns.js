@@ -1,129 +1,84 @@
-    const express = require("express");
-const { v4: uuid } = require("uuid");
-const { body, validationResult } = require("express-validator");
-const db = require("../config/database");
-const auth = require("../middleware/auth");
-
-const router = express.Router();
-router.use(auth);
-
-const VALID_STATUSES = ["filed", "pending", "not-filed"];
-
-// ── GET /api/returns ───────────────────────────────────────────────────────
-router.get("/", (req, res) => {
-  const { period, client_id } = req.query;
-
-  let query = `
-    SELECT r.*, c.name AS client_name, c.gstin
-    FROM returns r
-    JOIN clients c ON r.client_id = c.id
-    WHERE r.user_id = ?
-  `;
-  const params = [req.user.id];
-
-  if (period)    { query += " AND r.period = ?";    params.push(period);    }
-  if (client_id) { query += " AND r.client_id = ?"; params.push(client_id); }
-
-  query += " ORDER BY c.name ASC, r.period DESC";
-
-  const returns = db.prepare(query).all(...params);
-  res.json({ success: true, count: returns.length, returns });
+const returnsRouter = express.Router();
+returnsRouter.use(auth);
+ 
+returnsRouter.get("/", async (req, res) => {
+  try {
+    const { period, client_id } = req.query;
+    let query = "SELECT r.*, c.name as client_name, c.gstin FROM returns r JOIN clients c ON r.client_id=c.id WHERE r.user_id=$1";
+    const params = [req.user.id];
+    if (period)    { query += ` AND r.period=$${params.length+1}`;    params.push(period);    }
+    if (client_id) { query += ` AND r.client_id=$${params.length+1}`; params.push(client_id); }
+    query += " ORDER BY c.name ASC, r.period DESC";
+    const result = await pool.query(query, params);
+    res.json({ success: true, count: result.rows.length, returns: result.rows });
+  } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
-
-// ── GET /api/returns/summary ───────────────────────────────────────────────
-router.get("/summary", (req, res) => {
-  const { period } = req.query;
-  if (!period) return res.status(400).json({ success: false, message: "Period is required." });
-
-  const count = (field, status) =>
-    db.prepare(`SELECT COUNT(*) as cnt FROM returns WHERE user_id=? AND period=? AND ${field}=?`).get(req.user.id, period, status).cnt;
-
-  res.json({
-    success: true,
-    period,
-    summary: {
-      gstr1:  { filed: count("gstr1_status","filed"),  pending: count("gstr1_status","pending"),  not_filed: count("gstr1_status","not-filed")  },
-      gstr3b: { filed: count("gstr3b_status","filed"), pending: count("gstr3b_status","pending"), not_filed: count("gstr3b_status","not-filed") },
-      gstr9:  { filed: count("gstr9_status","filed"),  pending: count("gstr9_status","pending"),  not_filed: count("gstr9_status","not-filed")  },
-    }
-  });
+ 
+returnsRouter.get("/summary", async (req, res) => {
+  try {
+    const { period } = req.query;
+    if (!period) return res.status(400).json({ success: false, message: "Period required" });
+    const count = async (field, status) => {
+      const r = await pool.query(`SELECT COUNT(*) as cnt FROM returns WHERE user_id=$1 AND period=$2 AND ${field}=$3`, [req.user.id, period, status]);
+      return parseInt(r.rows[0].cnt);
+    };
+    res.json({
+      success: true, period,
+      summary: {
+        gstr1:  { filed: await count("gstr1_status","filed"),  pending: await count("gstr1_status","pending"),  not_filed: await count("gstr1_status","not-filed")  },
+        gstr3b: { filed: await count("gstr3b_status","filed"), pending: await count("gstr3b_status","pending"), not_filed: await count("gstr3b_status","not-filed") },
+        gstr9:  { filed: await count("gstr9_status","filed"),  pending: await count("gstr9_status","pending"),  not_filed: await count("gstr9_status","not-filed")  },
+      }
+    });
+  } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
-
-// ── GET /api/returns/:id ───────────────────────────────────────────────────
-router.get("/:id", (req, res) => {
-  const ret = db.prepare(`
-    SELECT r.*, c.name AS client_name, c.gstin
-    FROM returns r JOIN clients c ON r.client_id=c.id
-    WHERE r.id=? AND r.user_id=?
-  `).get(req.params.id, req.user.id);
-
-  if (!ret) return res.status(404).json({ success: false, message: "Record not found." });
-  res.json({ success: true, return: ret });
-});
-
-// ── POST /api/returns ──────────────────────────────────────────────────────
-router.post("/", [
-  body("client_id").notEmpty().withMessage("Client is required"),
-  body("period").trim().notEmpty().withMessage("Period is required (e.g. FY 2024-25)"),
-  body("gstr1_status").isIn(VALID_STATUSES).withMessage("Invalid GSTR-1 status"),
-  body("gstr3b_status").isIn(VALID_STATUSES).withMessage("Invalid GSTR-3B status"),
-  body("gstr9_status").isIn(VALID_STATUSES).withMessage("Invalid GSTR-9 status"),
-], (req, res) => {
+ 
+returnsRouter.post("/", [
+  body("client_id").notEmpty(),
+  body("period").trim().notEmpty(),
+  body("gstr1_status").isIn(["filed","pending","not-filed"]),
+  body("gstr3b_status").isIn(["filed","pending","not-filed"]),
+  body("gstr9_status").isIn(["filed","pending","not-filed"]),
+], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ success: false, errors: errors.array() });
-
-  const { client_id, period, gstr1_status, gstr3b_status, gstr9_status, gstr1_date, gstr3b_date, gstr9_date, notes } = req.body;
-
-  const client = db.prepare("SELECT id FROM clients WHERE id=? AND user_id=?").get(client_id, req.user.id);
-  if (!client) return res.status(404).json({ success: false, message: "Client not found." });
-
-  const existing = db.prepare("SELECT id FROM returns WHERE user_id=? AND client_id=? AND period=?").get(req.user.id, client_id, period);
-  if (existing) return res.status(409).json({ success: false, message: "Return record for this client and period already exists." });
-
-  const id = uuid();
-  db.prepare(`
-    INSERT INTO returns (id, user_id, client_id, period, gstr1_status, gstr3b_status, gstr9_status, gstr1_date, gstr3b_date, gstr9_date, notes)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, req.user.id, client_id, period, gstr1_status, gstr3b_status, gstr9_status, gstr1_date||null, gstr3b_date||null, gstr9_date||null, notes||null);
-
-  const rec = db.prepare("SELECT * FROM returns WHERE id=?").get(id);
-  res.status(201).json({ success: true, message: "Return record created.", return: rec });
+  try {
+    const { client_id, period, gstr1_status, gstr3b_status, gstr9_status, gstr1_date, gstr3b_date, gstr9_date, notes } = req.body;
+    const client = await pool.query("SELECT id FROM clients WHERE id=$1 AND user_id=$2", [client_id, req.user.id]);
+    if (!client.rows[0]) return res.status(404).json({ success: false, message: "Client not found" });
+    const exists = await pool.query("SELECT id FROM returns WHERE user_id=$1 AND client_id=$2 AND period=$3", [req.user.id, client_id, period]);
+    if (exists.rows[0]) return res.status(409).json({ success: false, message: "Record already exists for this period" });
+    const id = uuid();
+    await pool.query(
+      "INSERT INTO returns (id,user_id,client_id,period,gstr1_status,gstr3b_status,gstr9_status,gstr1_date,gstr3b_date,gstr9_date,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+      [id, req.user.id, client_id, period, gstr1_status, gstr3b_status, gstr9_status, gstr1_date||null, gstr3b_date||null, gstr9_date||null, notes||null]
+    );
+    const rec = await pool.query("SELECT * FROM returns WHERE id=$1", [id]);
+    res.status(201).json({ success: true, message: "Return record created", return: rec.rows[0] });
+  } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
-
-// ── PUT /api/returns/:id ───────────────────────────────────────────────────
-router.put("/:id", [
-  body("gstr1_status").isIn(VALID_STATUSES).withMessage("Invalid GSTR-1 status"),
-  body("gstr3b_status").isIn(VALID_STATUSES).withMessage("Invalid GSTR-3B status"),
-  body("gstr9_status").isIn(VALID_STATUSES).withMessage("Invalid GSTR-9 status"),
-], (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ success: false, errors: errors.array() });
-
-  const rec = db.prepare("SELECT id FROM returns WHERE id=? AND user_id=?").get(req.params.id, req.user.id);
-  if (!rec) return res.status(404).json({ success: false, message: "Return record not found." });
-
-  const { gstr1_status, gstr3b_status, gstr9_status, gstr1_date, gstr3b_date, gstr9_date, notes } = req.body;
-
-  db.prepare(`
-    UPDATE returns SET gstr1_status=?, gstr3b_status=?, gstr9_status=?,
-    gstr1_date=?, gstr3b_date=?, gstr9_date=?, notes=?, updated_at=datetime('now')
-    WHERE id=?
-  `).run(gstr1_status, gstr3b_status, gstr9_status, gstr1_date||null, gstr3b_date||null, gstr9_date||null, notes||null, req.params.id);
-
-  const updated = db.prepare("SELECT * FROM returns WHERE id=?").get(req.params.id);
-  res.json({ success: true, message: "Return updated.", return: updated });
+ 
+returnsRouter.put("/:id", async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id FROM returns WHERE id=$1 AND user_id=$2", [req.params.id, req.user.id]);
+    if (!r.rows[0]) return res.status(404).json({ success: false, message: "Record not found" });
+    const { gstr1_status, gstr3b_status, gstr9_status, gstr1_date, gstr3b_date, gstr9_date, notes } = req.body;
+    await pool.query(
+      "UPDATE returns SET gstr1_status=$1,gstr3b_status=$2,gstr9_status=$3,gstr1_date=$4,gstr3b_date=$5,gstr9_date=$6,notes=$7,updated_at=NOW() WHERE id=$8",
+      [gstr1_status, gstr3b_status, gstr9_status, gstr1_date||null, gstr3b_date||null, gstr9_date||null, notes||null, req.params.id]
+    );
+    const updated = await pool.query("SELECT * FROM returns WHERE id=$1", [req.params.id]);
+    res.json({ success: true, message: "Return updated", return: updated.rows[0] });
+  } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
-
-// ── DELETE /api/returns/:id ────────────────────────────────────────────────
-router.delete("/:id", (req, res) => {
-  const rec = db.prepare("SELECT id FROM returns WHERE id=? AND user_id=?").get(req.params.id, req.user.id);
-  if (!rec) return res.status(404).json({ success: false, message: "Record not found." });
-
-  db.prepare("DELETE FROM returns WHERE id=?").run(req.params.id);
-  res.json({ success: true, message: "Return record deleted." });
+ 
+returnsRouter.delete("/:id", async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id FROM returns WHERE id=$1 AND user_id=$2", [req.params.id, req.user.id]);
+    if (!r.rows[0]) return res.status(404).json({ success: false, message: "Record not found" });
+    await pool.query("DELETE FROM returns WHERE id=$1", [req.params.id]);
+    res.json({ success: true, message: "Record deleted" });
+  } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
-
-module.exports = router;
-
-    
-
+ 
+module.exports.returnsRouter = returnsRouter

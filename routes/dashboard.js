@@ -1,79 +1,51 @@
-    const express = require("express");
-const db = require("../config/database");
-const auth = require("../middleware/auth");
-
-const router = express.Router();
-router.use(auth);
-
-// ── GET /api/dashboard ─────────────────────────────────────────────────────
-router.get("/", (req, res) => {
-  const uid = req.user.id;
-  const today = new Date().toISOString().split("T")[0];
-  const in30Days = new Date(Date.now() + 30*24*60*60*1000).toISOString().split("T")[0];
-
-  // Client counts
-  const totalClients    = db.prepare("SELECT COUNT(*) as c FROM clients WHERE user_id=?").get(uid).c;
-  const compliantCount  = db.prepare("SELECT COUNT(*) as c FROM clients WHERE user_id=? AND status='compliant'").get(uid).c;
-  const pendingCount    = db.prepare("SELECT COUNT(*) as c FROM clients WHERE user_id=? AND status='pending'").get(uid).c;
-  const overdueCount    = db.prepare("SELECT COUNT(*) as c FROM clients WHERE user_id=? AND status='overdue'").get(uid).c;
-
-  // Notice counts
-  const openNotices     = db.prepare("SELECT COUNT(*) as c FROM notices WHERE user_id=? AND status NOT IN ('closed','replied')").get(uid).c;
-  const overdueNotices  = db.prepare("SELECT COUNT(*) as c FROM notices WHERE user_id=? AND status='overdue'").get(uid).c;
-  const dueSoon         = db.prepare("SELECT COUNT(*) as c FROM notices WHERE user_id=? AND due_date BETWEEN ? AND ? AND status NOT IN ('closed','replied')").get(uid, today, in30Days).c;
-
-  // Upcoming due notices (next 30 days)
-  const upcomingNotices = db.prepare(`
-    SELECT n.*, c.name AS client_name
-    FROM notices n JOIN clients c ON n.client_id=c.id
-    WHERE n.user_id=? AND n.due_date BETWEEN ? AND ? AND n.status NOT IN ('closed','replied')
-    ORDER BY n.due_date ASC LIMIT 5
-  `).all(uid, today, in30Days);
-
-  // Recent clients
-  const recentClients = db.prepare("SELECT * FROM clients WHERE user_id=? ORDER BY created_at DESC LIMIT 5").all(uid);
-
-  // Returns summary (last period with data)
-  const latestPeriod = db.prepare("SELECT period FROM returns WHERE user_id=? ORDER BY period DESC LIMIT 1").get(uid);
-  let returnsSummary = null;
-  if (latestPeriod) {
-    const p = latestPeriod.period;
-    const count = (field, status) =>
-      db.prepare(`SELECT COUNT(*) as c FROM returns WHERE user_id=? AND period=? AND ${field}=?`).get(uid, p, status).c;
-    returnsSummary = {
-      period: p,
-      gstr1:  { filed: count("gstr1_status","filed"),  pending: count("gstr1_status","pending"),  not_filed: count("gstr1_status","not-filed")  },
-      gstr3b: { filed: count("gstr3b_status","filed"), pending: count("gstr3b_status","pending"), not_filed: count("gstr3b_status","not-filed") },
-      gstr9:  { filed: count("gstr9_status","filed"),  pending: count("gstr9_status","pending"),  not_filed: count("gstr9_status","not-filed")  },
-    };
-  }
-
-  // Top ITC risk clients
-  const itcRisk = db.prepare(`
-    SELECT r.client_id, c.name AS client_name, c.gstin,
-           SUM(r.difference) AS total_risk,
-           COUNT(CASE WHEN r.status='mismatch' THEN 1 END) AS mismatches,
-           COUNT(CASE WHEN r.status='missing'  THEN 1 END) AS missing
-    FROM reconciliation r JOIN clients c ON r.client_id=c.id
-    WHERE r.user_id=?
-    GROUP BY r.client_id
-    ORDER BY ABS(total_risk) DESC LIMIT 5
-  `).all(uid);
-
-  res.json({
-    success: true,
-    dashboard: {
-      clients: { total: totalClients, compliant: compliantCount, pending: pendingCount, overdue: overdueCount },
-      notices: { open: openNotices, overdue: overdueNotices, due_in_30_days: dueSoon },
-      upcoming_notices: upcomingNotices,
-      recent_clients: recentClients,
-      returns_summary: returnsSummary,
-      itc_risk: itcRisk,
+const dashboardRouter = express.Router();
+dashboardRouter.use(auth);
+ 
+dashboardRouter.get("/", async (req, res) => {
+  try {
+    const uid = req.user.id;
+    const today = new Date().toISOString().split("T")[0];
+    const in30 = new Date(Date.now()+30*24*60*60*1000).toISOString().split("T")[0];
+ 
+    const [totalC, compliantC, pendingC, overdueC, openN, overdueN, dueSoonN, upcomingN, recentC, lastPeriod] = await Promise.all([
+      pool.query("SELECT COUNT(*) as c FROM clients WHERE user_id=$1", [uid]),
+      pool.query("SELECT COUNT(*) as c FROM clients WHERE user_id=$1 AND status='compliant'", [uid]),
+      pool.query("SELECT COUNT(*) as c FROM clients WHERE user_id=$1 AND status='pending'", [uid]),
+      pool.query("SELECT COUNT(*) as c FROM clients WHERE user_id=$1 AND status='overdue'", [uid]),
+      pool.query("SELECT COUNT(*) as c FROM notices WHERE user_id=$1 AND status NOT IN ('closed','replied')", [uid]),
+      pool.query("SELECT COUNT(*) as c FROM notices WHERE user_id=$1 AND status='overdue'", [uid]),
+      pool.query("SELECT COUNT(*) as c FROM notices WHERE user_id=$1 AND due_date BETWEEN $2 AND $3 AND status NOT IN ('closed','replied')", [uid, today, in30]),
+      pool.query("SELECT n.*, c.name as client_name FROM notices n JOIN clients c ON n.client_id=c.id WHERE n.user_id=$1 AND n.due_date BETWEEN $2 AND $3 AND n.status NOT IN ('closed','replied') ORDER BY n.due_date ASC LIMIT 5", [uid, today, in30]),
+      pool.query("SELECT * FROM clients WHERE user_id=$1 ORDER BY created_at DESC LIMIT 5", [uid]),
+      pool.query("SELECT period FROM returns WHERE user_id=$1 ORDER BY period DESC LIMIT 1", [uid]),
+    ]);
+ 
+    let returnsSummary = null;
+    if (lastPeriod.rows[0]) {
+      const p = lastPeriod.rows[0].period;
+      const count = async (field, status) => {
+        const r = await pool.query(`SELECT COUNT(*) as c FROM returns WHERE user_id=$1 AND period=$2 AND ${field}=$3`, [uid, p, status]);
+        return parseInt(r.rows[0].c);
+      };
+      returnsSummary = {
+        period: p,
+        gstr1:  { filed: await count("gstr1_status","filed"),  pending: await count("gstr1_status","pending"),  not_filed: await count("gstr1_status","not-filed")  },
+        gstr3b: { filed: await count("gstr3b_status","filed"), pending: await count("gstr3b_status","pending"), not_filed: await count("gstr3b_status","not-filed") },
+        gstr9:  { filed: await count("gstr9_status","filed"),  pending: await count("gstr9_status","pending"),  not_filed: await count("gstr9_status","not-filed")  },
+      };
     }
-  });
+ 
+    res.json({
+      success: true,
+      dashboard: {
+        clients: { total: parseInt(totalC.rows[0].c), compliant: parseInt(compliantC.rows[0].c), pending: parseInt(pendingC.rows[0].c), overdue: parseInt(overdueC.rows[0].c) },
+        notices: { open: parseInt(openN.rows[0].c), overdue: parseInt(overdueN.rows[0].c), due_in_30_days: parseInt(dueSoonN.rows[0].c) },
+        upcoming_notices: upcomingN.rows,
+        recent_clients: recentC.rows,
+        returns_summary: returnsSummary,
+      }
+    });
+  } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
-
-module.exports = router;
-
-    
-
+ 
+module.exports.dashboardRouter = dashboardRouter;
