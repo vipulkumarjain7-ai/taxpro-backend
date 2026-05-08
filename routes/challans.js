@@ -23,7 +23,7 @@ router.get("/", async (req, res) => {
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-// POST create challan
+// POST create challans
 router.post("/", [
   body("client_id").notEmpty().withMessage("Client is required"),
   body("challan_no").trim().notEmpty().withMessage("Challan number is required"),
@@ -47,7 +47,7 @@ router.post("/", [
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-// PUT update challan
+// PUT update challans
 router.put("/:id", async (req, res) => {
   try {
     const ch = await pool.query("SELECT id FROM challans WHERE id=$1 AND user_id=$2", [req.params.id, req.user.id]);
@@ -62,7 +62,7 @@ router.put("/:id", async (req, res) => {
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-// DELETE challan
+// DELETE challans
 router.delete("/:id", async (req, res) => {
   try {
     const ch = await pool.query("SELECT id FROM challans WHERE id=$1 AND user_id=$2", [req.params.id, req.user.id]);
