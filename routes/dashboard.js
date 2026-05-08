@@ -1,14 +1,16 @@
 const express = require("express");
-const dashboardRouter = express.Router();
+const pool = require("../config/database");
 const auth = require("../middleware/auth");
-dashboardRouter.use(auth);
- 
-dashboardRouter.get("/", async (req, res) => {
+
+const router = express.Router();
+router.use(auth);
+
+router.get("/", async (req, res) => {
   try {
     const uid = req.user.id;
     const today = new Date().toISOString().split("T")[0];
-    const in30 = new Date(Date.now()+30*24*60*60*1000).toISOString().split("T")[0];
- 
+    const in30  = new Date(Date.now()+30*24*60*60*1000).toISOString().split("T")[0];
+
     const [totalC, compliantC, pendingC, overdueC, openN, overdueN, dueSoonN, upcomingN, recentC, lastPeriod] = await Promise.all([
       pool.query("SELECT COUNT(*) as c FROM clients WHERE user_id=$1", [uid]),
       pool.query("SELECT COUNT(*) as c FROM clients WHERE user_id=$1 AND status='compliant'", [uid]),
@@ -21,7 +23,7 @@ dashboardRouter.get("/", async (req, res) => {
       pool.query("SELECT * FROM clients WHERE user_id=$1 ORDER BY created_at DESC LIMIT 5", [uid]),
       pool.query("SELECT period FROM returns WHERE user_id=$1 ORDER BY period DESC LIMIT 1", [uid]),
     ]);
- 
+
     let returnsSummary = null;
     if (lastPeriod.rows[0]) {
       const p = lastPeriod.rows[0].period;
@@ -36,7 +38,7 @@ dashboardRouter.get("/", async (req, res) => {
         gstr9:  { filed: await count("gstr9_status","filed"),  pending: await count("gstr9_status","pending"),  not_filed: await count("gstr9_status","not-filed")  },
       };
     }
- 
+
     res.json({
       success: true,
       dashboard: {
@@ -49,5 +51,5 @@ dashboardRouter.get("/", async (req, res) => {
     });
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
- 
-module.exports = dashboardRouter;
+
+module.exports = router;

@@ -1,7 +1,12 @@
-const recoRouter = express.Router();
-recoRouter.use(auth);
- 
-recoRouter.get("/", async (req, res) => {
+const express = require("express");
+const { v4: uuid } = require("uuid");
+const pool = require("../config/database");
+const auth = require("../middleware/auth");
+
+const router = express.Router();
+router.use(auth);
+
+router.get("/", async (req, res) => {
   try {
     const { client_id, period, status } = req.query;
     if (!client_id || !period) return res.status(400).json({ success: false, message: "client_id and period required" });
@@ -17,8 +22,8 @@ recoRouter.get("/", async (req, res) => {
     res.json({ success: true, count: rows.rows.length, summary: { matched, mismatch, missing, total_itc_risk: totalRisk }, rows: rows.rows });
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
- 
-recoRouter.post("/", async (req, res) => {
+
+router.post("/", async (req, res) => {
   try {
     const { client_id, period, vendor_name, vendor_gstin, invoice_count, gstr2a_amount, gstr2b_amount, books_amount, remarks } = req.body;
     const client = await pool.query("SELECT id FROM clients WHERE id=$1 AND user_id=$2", [client_id, req.user.id]);
@@ -37,8 +42,27 @@ recoRouter.post("/", async (req, res) => {
     res.status(201).json({ success: true, message: "Entry added", row: row.rows[0] });
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
- 
-recoRouter.delete("/:id", async (req, res) => {
+
+router.put("/:id", async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id FROM reconciliation WHERE id=$1 AND user_id=$2", [req.params.id, req.user.id]);
+    if (!r.rows[0]) return res.status(404).json({ success: false, message: "Entry not found" });
+    const { gstr2a_amount, gstr2b_amount, books_amount, invoice_count, remarks } = req.body;
+    const g2a = parseFloat(gstr2a_amount)||0, g2b = parseFloat(gstr2b_amount)||0, bks = parseFloat(books_amount)||0;
+    const diff = g2b - bks;
+    let status = "matched";
+    if (g2b===0 && bks>0) status = "missing";
+    else if (Math.abs(diff)>0) status = "mismatch";
+    await pool.query(
+      "UPDATE reconciliation SET gstr2a_amount=$1,gstr2b_amount=$2,books_amount=$3,difference=$4,invoice_count=$5,status=$6,remarks=$7,updated_at=NOW() WHERE id=$8",
+      [g2a, g2b, bks, diff, invoice_count||0, status, remarks||null, req.params.id]
+    );
+    const updated = await pool.query("SELECT * FROM reconciliation WHERE id=$1", [req.params.id]);
+    res.json({ success: true, message: "Entry updated", row: updated.rows[0] });
+  } catch(e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+router.delete("/:id", async (req, res) => {
   try {
     const r = await pool.query("SELECT id FROM reconciliation WHERE id=$1 AND user_id=$2", [req.params.id, req.user.id]);
     if (!r.rows[0]) return res.status(404).json({ success: false, message: "Entry not found" });
@@ -46,5 +70,5 @@ recoRouter.delete("/:id", async (req, res) => {
     res.json({ success: true, message: "Entry deleted" });
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
- 
-module.exports.recoRouter = recoRouter;
+
+module.exports = router;
