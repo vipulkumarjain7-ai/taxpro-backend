@@ -16,9 +16,9 @@ const initDB = async () => {
         firm_name   TEXT,
         frn         TEXT,
         role        TEXT NOT NULL DEFAULT 'ca',
+        parent_id   TEXT,
         created_at  TIMESTAMP DEFAULT NOW()
       );
-
       CREATE TABLE IF NOT EXISTS clients (
         id          TEXT PRIMARY KEY,
         user_id     TEXT NOT NULL,
@@ -33,7 +33,6 @@ const initDB = async () => {
         updated_at  TIMESTAMP DEFAULT NOW(),
         UNIQUE(user_id, gstin)
       );
-
       CREATE TABLE IF NOT EXISTS notices (
         id           TEXT PRIMARY KEY,
         user_id      TEXT NOT NULL,
@@ -50,7 +49,6 @@ const initDB = async () => {
         created_at   TIMESTAMP DEFAULT NOW(),
         updated_at   TIMESTAMP DEFAULT NOW()
       );
-
       CREATE TABLE IF NOT EXISTS returns (
         id             TEXT PRIMARY KEY,
         user_id        TEXT NOT NULL,
@@ -67,7 +65,6 @@ const initDB = async () => {
         updated_at     TIMESTAMP DEFAULT NOW(),
         UNIQUE(user_id, client_id, period)
       );
-
       CREATE TABLE IF NOT EXISTS reconciliation (
         id              TEXT PRIMARY KEY,
         user_id         TEXT NOT NULL,
@@ -85,7 +82,6 @@ const initDB = async () => {
         created_at      TIMESTAMP DEFAULT NOW(),
         updated_at      TIMESTAMP DEFAULT NOW()
       );
-
       CREATE TABLE IF NOT EXISTS challans (
         id           TEXT PRIMARY KEY,
         user_id      TEXT NOT NULL,
@@ -95,18 +91,20 @@ const initDB = async () => {
         amount       REAL DEFAULT 0,
         period       TEXT,
         payment_date TEXT,
-        status       TEXT NOT NULL DEFAULT 'pending',
+        status       TEXT NOT NULL DEFAULT 'paid',
         notes        TEXT,
         created_at   TIMESTAMP DEFAULT NOW(),
         updated_at   TIMESTAMP DEFAULT NOW()
       );
     `);
-    console.log("✅ PostgreSQL Database initialised successfully");
+    console.log("✅ PostgreSQL Database initialised");
   } catch (err) {
-    console.error("❌ Database init error:", err.message);
+    console.error("❌ DB Error:", err.message);
     process.exit(1);
   }
 };
 
 initDB();
 module.exports = pool;
+EOF
+echo= "database.js updated"
