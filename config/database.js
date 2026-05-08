@@ -1,5 +1,5 @@
+const { Pool } = require("pg");
 console.log("DATABASE_URL exists:", !!process.env.DATABASE_URL);
-
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl:
@@ -14,7 +14,6 @@ pool.connect()
     console.error("❌ PostgreSQL Connection Error:", err.message);
     process.exit(1);
   });
-
 const initDB = async () => {
   try {
     await pool.query(`
