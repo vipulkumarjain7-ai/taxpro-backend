@@ -1,9 +1,19 @@
-const { Pool } = require("pg");
+console.log("DATABASE_URL exists:", !!process.env.DATABASE_URL);
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
+  ssl:
+    process.env.NODE_ENV === "production"
+      ? { rejectUnauthorized: false }
+      : false,
+  connectionTimeoutMillis: 10000,
 });
+pool.connect()
+  .then(() => console.log("✅ PostgreSQL Connected"))
+  .catch(err => {
+    console.error("❌ PostgreSQL Connection Error:", err.message);
+    process.exit(1);
+  });
 
 const initDB = async () => {
   try {
