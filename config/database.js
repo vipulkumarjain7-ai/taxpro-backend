@@ -106,5 +106,3 @@ const initDB = async () => {
 
 initDB();
 module.exports = pool;
-EOF
-echo= "database.js updated"
