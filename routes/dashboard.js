@@ -50,4 +50,4 @@ dashboardRouter.get("/", async (req, res) => {
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
  
-module.exports.dashboardRouter = dashboardRouter;
+module.exports = dashboardRouter;

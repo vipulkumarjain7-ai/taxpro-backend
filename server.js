@@ -4,6 +4,7 @@ const cors = require("cors");
 const helmet = require("helmet");
 const morgan = require("morgan");
 const rateLimit = require("express-rate-limit");
+const dashboardRouter = require("./routes/dashboard");
 
 require("./config/database");
 
