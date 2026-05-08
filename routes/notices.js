@@ -3,12 +3,11 @@ const { v4: uuid } = require("uuid");
 const { body, validationResult } = require("express-validator");
 const pool = require("../config/database");
 const auth = require("../middleware/auth");
- 
-// ── NOTICES ──────────────────────────────────────────────────────────────
-const noticesRouter = express.Router();
-noticesRouter.use(auth);
- 
-noticesRouter.get("/", async (req, res) => {
+
+const router = express.Router();
+router.use(auth);
+
+router.get("/", async (req, res) => {
   try {
     const { status, priority, client_id } = req.query;
     let query = "SELECT n.*, c.name as client_name, c.gstin FROM notices n JOIN clients c ON n.client_id=c.id WHERE n.user_id=$1";
@@ -21,8 +20,8 @@ noticesRouter.get("/", async (req, res) => {
     res.json({ success: true, count: result.rows.length, notices: result.rows });
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
- 
-noticesRouter.post("/", [
+
+router.post("/", [
   body("client_id").notEmpty(),
   body("ref_no").trim().notEmpty(),
   body("type").trim().notEmpty(),
@@ -48,8 +47,8 @@ noticesRouter.post("/", [
     res.status(201).json({ success: true, message: "Notice added", notice: notice.rows[0] });
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
- 
-noticesRouter.put("/:id", async (req, res) => {
+
+router.put("/:id", async (req, res) => {
   try {
     const n = await pool.query("SELECT id FROM notices WHERE id=$1 AND user_id=$2", [req.params.id, req.user.id]);
     if (!n.rows[0]) return res.status(404).json({ success: false, message: "Notice not found" });
@@ -62,8 +61,8 @@ noticesRouter.put("/:id", async (req, res) => {
     res.json({ success: true, message: "Notice updated", notice: updated.rows[0] });
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
- 
-noticesRouter.patch("/:id/status", async (req, res) => {
+
+router.patch("/:id/status", async (req, res) => {
   try {
     const { status } = req.body;
     const n = await pool.query("SELECT id FROM notices WHERE id=$1 AND user_id=$2", [req.params.id, req.user.id]);
@@ -72,8 +71,8 @@ noticesRouter.patch("/:id/status", async (req, res) => {
     res.json({ success: true, message: "Status updated" });
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
- 
-noticesRouter.delete("/:id", async (req, res) => {
+
+router.delete("/:id", async (req, res) => {
   try {
     const n = await pool.query("SELECT id FROM notices WHERE id=$1 AND user_id=$2", [req.params.id, req.user.id]);
     if (!n.rows[0]) return res.status(404).json({ success: false, message: "Notice not found" });
@@ -81,5 +80,5 @@ noticesRouter.delete("/:id", async (req, res) => {
     res.json({ success: true, message: "Notice deleted" });
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
 });
- 
-module.exports.noticesRouter = noticesRouter;
+
+module.exports = router;

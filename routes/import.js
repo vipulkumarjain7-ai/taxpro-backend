@@ -25,4 +25,4 @@ importRouter.post("/clients", upload.single("file"), async (req, res) => {
     res.json({ success: true, message: `${imported} clients imported, ${skipped} skipped` });
   } catch(e) { res.status(500).json({ success: false, message: "Import failed: "+e.message }); }
 });
-module.exports = Router;
+module.exports = importRouter;
