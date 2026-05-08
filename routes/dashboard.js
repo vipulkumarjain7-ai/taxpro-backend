@@ -1,6 +1,6 @@
 const express = require("express");
 const dashboardRouter = express.Router();
-const auth = require("../middlewares/auth");
+const auth = require("../middleware/auth");
 dashboardRouter.use(auth);
  
 dashboardRouter.get("/", async (req, res) => {
