@@ -28,6 +28,7 @@ app.use("/api/notices",        require("./routes/notices"));
 app.use("/api/returns",        require("./routes/returns"));
 app.use("/api/reconciliation", require("./routes/reconciliation"));
 app.use("/api/challans",       require("./routes/challans"));
+app.use("/api/gstr2A",         require("./routes/gstr2A"));
 app.use("/api/ai",             require("./routes/ai"));
 app.use("/api/import",         require("./routes/import"));
 app.use("/api/staff",          require("./routes/staff"));
@@ -61,6 +62,7 @@ app.listen(PORT, () => {
   console.log(`   STAFF:          /api/staff`);
   console.log(`   REPORTS:        /api/reports`);
   console.log(`   WHATSAPP:       /api/whatsapp\n`);
+  console.log(`   GSTR2A:         /api/GSTR2A`);
 });
 
 module.exports = app;
