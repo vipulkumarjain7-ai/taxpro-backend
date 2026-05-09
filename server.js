@@ -33,7 +33,7 @@ app.use("/api/import",         require("./routes/import"));
 app.use("/api/staff",          require("./routes/staff"));
 app.use("/api/reports",        require("./routes/reports"));
 app.use("/api/whatsapp",       require("./routes/whatsapp"));
-
+app.use("/api/gstin",          require("./routes/gstin"));
 app.get("/health", (req, res) => {
   res.json({ success: true, message: "TaxPro GST API running", version: "2.0.0" });
 });
