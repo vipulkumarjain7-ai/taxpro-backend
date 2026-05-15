@@ -121,6 +121,7 @@ app.use("/api/invoices", invoicesRoutes);
 app.use("/api/payments", paymentsRoutes);
 app.use("/api/inventory", inventoryRoutes);
 app.use("/api/accounting", accountingRoutes);
+app.use("/api/suppliers", suppliersRoutes);
 
 /* -------------------------------------------------------
    404 HANDLER
