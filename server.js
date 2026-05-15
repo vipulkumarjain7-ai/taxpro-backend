@@ -32,7 +32,7 @@ app.use("/api/ai",             require("./routes/ai"));
 app.use("/api/import",         require("./routes/import"));
 app.use("/api/staff",          require("./routes/staff"));
 app.use("/api/gstin",          require("./routes/gstin"));
-app.use("/api/gstr2a",         require("./routes/gstr2a"));
+app.use("/api/gstr2A",         require("./routes/gstr2A"));
 
 // ── Accounting Routes ──────────────────────────────────────────────────────
 app.use("/api/products",       require("./routes/products"));
