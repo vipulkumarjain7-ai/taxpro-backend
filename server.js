@@ -1,68 +1,164 @@
 require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
-const helmet = require("helmet");
-const morgan = require("morgan");
-const rateLimit = require("express-rate-limit");
+const path = require("path");
 
+// Initialize database (this also runs initDB() from config/database.js)
 require("./config/database");
 
 const app = express();
-const PORT = process.env.PORT || 5000;
 
-app.set("trust proxy", 1);
+/* -------------------------------------------------------
+   BASIC CONFIGURATION
+------------------------------------------------------- */
 
-app.use(helmet());
-app.use(cors({ origin: "*", methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"], allowedHeaders: ["Content-Type","Authorization"] }));
-app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true }));
+// CORS
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  })
+);
 
-app.use("/api/", rateLimit({ windowMs: 15*60*1000, max: 200 }));
+// Body Parsers
+app.use(express.json({ limit: "25mb" }));
+app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 
-// ── Routes ─────────────────────────────────────────────────────────────────
-app.use("/api/auth",           require("./routes/auth"));
-app.use("/api/dashboard",      require("./routes/dashboard"));
-app.use("/api/clients",        require("./routes/clients"));
-app.use("/api/notices",        require("./routes/notices"));
-app.use("/api/returns",        require("./routes/returns"));
-app.use("/api/reconciliation", require("./routes/reconciliation"));
-app.use("/api/challans",       require("./routes/challans"));
-app.use("/api/gstr2A",         require("./routes/gstr2A"));
-app.use("/api/ai",             require("./routes/ai"));
-app.use("/api/import",         require("./routes/import"));
-app.use("/api/staff",          require("./routes/staff"));
-app.use("/api/reports",        require("./routes/reports"));
-app.use("/api/whatsapp",       require("./routes/whatsapp"));
-app.use("/api/gstin",          require("./routes/gstin"));
-app.get("/health", (req, res) => {
-  res.json({ success: true, message: "TaxPro GST API running", version: "2.0.0" });
+// Static files (logos, uploads, generated PDFs, etc.)
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+
+/* -------------------------------------------------------
+   EXISTING ROUTES
+------------------------------------------------------- */
+
+const authRoutes = require("./routes/auth");
+const clientsRoutes = require("./routes/clients");
+const dashboardRoutes = require("./routes/dashboard");
+const gstinRoutes = require("./routes/gstin");
+const gstr2ARoutes = require("./routes/gstr2A");
+const returnsRoutes = require("./routes/returns");
+const reconciliationRoutes = require("./routes/reconciliation");
+const challansRoutes = require("./routes/challans");
+const reportsRoutes = require("./routes/reports");
+const noticesRoutes = require("./routes/notices");
+const staffRoutes = require("./routes/staff");
+const whatsappRoutes = require("./routes/whatsapp");
+const aiRoutes = require("./routes/ai");
+
+/* -------------------------------------------------------
+   NEW ERP ROUTES
+------------------------------------------------------- */
+
+const productsRoutes = require("./routes/products");
+const invoicesRoutes = require("./routes/invoices");
+const paymentsRoutes = require("./routes/payments");
+const inventoryRoutes = require("./routes/inventory");
+const accountingRoutes = require("./routes/accounting");
+
+/* -------------------------------------------------------
+   HEALTH CHECK
+------------------------------------------------------- */
+
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    message: "TaxPro ERP API is running successfully",
+    version: "2.0.0",
+    modules: [
+      "Authentication",
+      "Clients",
+      "GSTIN Verification",
+      "GSTR-2A",
+      "Returns",
+      "Reconciliation",
+      "Challans",
+      "Reports",
+      "Notices",
+      "Staff Management",
+      "WhatsApp",
+      "AI Assistant",
+      "Products & Inventory",
+      "Invoice & Billing",
+      "Payments",
+      "Accounting",
+    ],
+    timestamp: new Date().toISOString(),
+  });
 });
 
-app.use((req, res) => res.status(404).json({ success: false, message: `Route ${req.method} ${req.url} not found` }));
+app.get("/api/health", (req, res) => {
+  res.json({
+    success: true,
+    status: "OK",
+    serverTime: new Date().toISOString(),
+    environment: process.env.NODE_ENV || "development",
+  });
+});
+
+/* -------------------------------------------------------
+   REGISTER API ROUTES
+------------------------------------------------------- */
+
+// Existing modules
+app.use("/api/auth", authRoutes);
+app.use("/api/clients", clientsRoutes);
+app.use("/api/dashboard", dashboardRoutes);
+app.use("/api/gstin", gstinRoutes);
+app.use("/api/gstr2a", gstr2ARoutes);
+app.use("/api/returns", returnsRoutes);
+app.use("/api/reconciliation", reconciliationRoutes);
+app.use("/api/challans", challansRoutes);
+app.use("/api/reports", reportsRoutes);
+app.use("/api/notices", noticesRoutes);
+app.use("/api/staff", staffRoutes);
+app.use("/api/whatsapp", whatsappRoutes);
+app.use("/api/ai", aiRoutes);
+
+// New ERP modules
+app.use("/api/products", productsRoutes);
+app.use("/api/invoices", invoicesRoutes);
+app.use("/api/payments", paymentsRoutes);
+app.use("/api/inventory", inventoryRoutes);
+app.use("/api/accounting", accountingRoutes);
+
+/* -------------------------------------------------------
+   404 HANDLER
+------------------------------------------------------- */
+
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: "API endpoint not found",
+    path: req.originalUrl,
+  });
+});
+
+/* -------------------------------------------------------
+   GLOBAL ERROR HANDLER
+------------------------------------------------------- */
 
 app.use((err, req, res, next) => {
-  console.error(err);
-  res.status(500).json({ success: false, message: process.env.NODE_ENV === "production" ? "Server error" : err.message });
+  console.error("❌ Server Error:", err);
+
+  res.status(err.status || 500).json({
+    success: false,
+    message: err.message || "Internal Server Error",
+    ...(process.env.NODE_ENV !== "production" && {
+      stack: err.stack,
+    }),
+  });
 });
+
+/* -------------------------------------------------------
+   START SERVER
+------------------------------------------------------- */
+
+const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
-  console.log(`\n🚀 TaxPro GST Backend v2.0 running on port ${PORT}`);
-  console.log(`📋 Environment: ${process.env.NODE_ENV || "development"}`);
-  console.log(`\n📌 All Endpoints:`);
-  console.log(`   AUTH:           /api/auth`);
-  console.log(`   DASHBOARD:      /api/dashboard`);
-  console.log(`   CLIENTS:        /api/clients`);
-  console.log(`   NOTICES:        /api/notices`);
-  console.log(`   RETURNS:        /api/returns`);
-  console.log(`   RECONCILIATION: /api/reconciliation`);
-  console.log(`   CHALLANS:       /api/challans`);
-  console.log(`   AI:             /api/ai`);
-  console.log(`   IMPORT:         /api/import`);
-  console.log(`   STAFF:          /api/staff`);
-  console.log(`   REPORTS:        /api/reports`);
-  console.log(`   WHATSAPP:       /api/whatsapp\n`);
-  console.log(`   GSTR2A:         /api/GSTR2A`);
+  console.log("🚀 TaxPro ERP Server Started");
+  console.log(`🌐 Server URL: http://localhost:${PORT}`);
+  console.log(`📦 Environment: ${process.env.NODE_ENV || "development"}`);
+  console.log("✅ Modules Loaded Successfully");
 });
-
-module.exports = app;
