@@ -123,6 +123,29 @@ db.exec(`
 
 console.log("✅ Database initialised at", process.env.DB_PATH || "./taxpro.db");
 
+// ── Migration: Add new columns to existing tables ──────────────────────────
+const migrations = [
+  ["clients",  "phone",        "TEXT"],
+  ["clients",  "email",        "TEXT"],
+  ["clients",  "address",      "TEXT"],
+  ["clients",  "city",         "TEXT"],
+  ["clients",  "pincode",      "TEXT"],
+  ["clients",  "pan",          "TEXT"],
+  ["clients",  "credit_limit", "REAL DEFAULT 0"],
+  ["users",    "parent_id",    "TEXT"],
+  ["users",    "gstin",        "TEXT"],
+  ["users",    "phone",        "TEXT"],
+  ["users",    "logo_url",     "TEXT"],
+  ["invoices", "cess_amount",  "REAL DEFAULT 0"],
+  ["invoices", "einvoice_irn", "TEXT"],
+  ["invoice_items", "discount_pct", "REAL DEFAULT 0"],
+];
+for (const [table, col, type] of migrations) {
+  try { db.prepare(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`).run(); }
+  catch(e) { /* column already exists — ignore */ }
+}
+console.log("✅ Database migration complete");
+
 // ── Middleware ─────────────────────────────────────────────────────────────
 app.use(cors({ origin:"*", methods:["GET","POST","PUT","PATCH","DELETE","OPTIONS"], allowedHeaders:["Content-Type","Authorization"] }));
 app.use(morgan("combined"));
