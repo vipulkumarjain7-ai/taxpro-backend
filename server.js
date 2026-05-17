@@ -8,7 +8,7 @@ const morgan     = require("morgan");
 const multer     = require("multer");
 const XLSX       = require("xlsx");
 const https      = require("https");
-const Database   = require("pg");
+const Database   = require("better-sqlite3");
 const path       = require("path");
 
 const app  = express();
@@ -118,103 +118,6 @@ db.exec(`
     account_no TEXT, from_date TEXT, to_date TEXT, total_txns INTEGER DEFAULT 0,
     total_debit REAL DEFAULT 0, total_credit REAL DEFAULT 0, filename TEXT,
     created_at TEXT DEFAULT (datetime('now'))
-  );
-   CREATE TABLE IF NOT EXISTS companies (
-    id              TEXT PRIMARY KEY,
-    user_id         TEXT NOT NULL,
-    name            TEXT NOT NULL,
-    legal_name      TEXT,
-    gstin           TEXT,
-    pan             TEXT,
-    address         TEXT,
-    city            TEXT,
-    state           TEXT,
-    pincode         TEXT,
-    phone           TEXT,
-    email           TEXT,
-    financial_year  TEXT DEFAULT 'Apr-Mar',
-    fy_start        TEXT DEFAULT '2025-04-01',
-    fy_end          TEXT DEFAULT '2026-03-31',
-    currency        TEXT DEFAULT 'INR',
-    logo_url        TEXT,
-    is_active       INTEGER DEFAULT 1,
-    created_at      TEXT DEFAULT (datetime('now'))
-  );
- 
-  CREATE TABLE IF NOT EXISTS ledger_groups (
-    id              TEXT PRIMARY KEY,
-    user_id         TEXT NOT NULL,
-    company_id      TEXT NOT NULL,
-    name            TEXT NOT NULL,
-    parent_id       TEXT,
-    nature          TEXT NOT NULL,
-    affects_gross   INTEGER DEFAULT 0,
-    is_default      INTEGER DEFAULT 0,
-    created_at      TEXT DEFAULT (datetime('now'))
-  );
- 
-  CREATE TABLE IF NOT EXISTS ledgers (
-    id              TEXT PRIMARY KEY,
-    user_id         TEXT NOT NULL,
-    company_id      TEXT NOT NULL,
-    group_id        TEXT NOT NULL,
-    name            TEXT NOT NULL,
-    alias           TEXT,
-    opening_balance REAL DEFAULT 0,
-    opening_type    TEXT DEFAULT 'Dr',
-    gstin           TEXT,
-    pan             TEXT,
-    address         TEXT,
-    phone           TEXT,
-    email           TEXT,
-    bank_account    TEXT,
-    bank_name       TEXT,
-    ifsc_code       TEXT,
-    credit_limit    REAL DEFAULT 0,
-    credit_days     INTEGER DEFAULT 0,
-    is_default      INTEGER DEFAULT 0,
-    notes           TEXT,
-    created_at      TEXT DEFAULT (datetime('now')),
-    updated_at      TEXT DEFAULT (datetime('now'))
-  );
- 
-  CREATE TABLE IF NOT EXISTS vouchers (
-    id              TEXT PRIMARY KEY,
-    user_id         TEXT NOT NULL,
-    company_id      TEXT NOT NULL,
-    voucher_no      TEXT NOT NULL,
-    voucher_type    TEXT NOT NULL,
-    date            TEXT NOT NULL,
-    ref_no          TEXT,
-    narration       TEXT,
-    party_ledger_id TEXT,
-    party_name      TEXT,
-    total_amount    REAL DEFAULT 0,
-    is_posted       INTEGER DEFAULT 1,
-    is_cancelled    INTEGER DEFAULT 0,
-    created_at      TEXT DEFAULT (datetime('now')),
-    updated_at      TEXT DEFAULT (datetime('now'))
-  );
- 
-  CREATE TABLE IF NOT EXISTS voucher_items (
-    id              TEXT PRIMARY KEY,
-    voucher_id      TEXT NOT NULL,
-    ledger_id       TEXT NOT NULL,
-    ledger_name     TEXT NOT NULL,
-    dr_amount       REAL DEFAULT 0,
-    cr_amount       REAL DEFAULT 0,
-    narration       TEXT,
-    sort_order      INTEGER DEFAULT 0
-  );
- 
-  CREATE TABLE IF NOT EXISTS godowns (
-    id              TEXT PRIMARY KEY,
-    user_id         TEXT NOT NULL,
-    company_id      TEXT NOT NULL,
-    name            TEXT NOT NULL,
-    address         TEXT,
-    is_default      INTEGER DEFAULT 0,
-    created_at      TEXT DEFAULT (datetime('now'))
   );
 `);
 
@@ -1074,6 +977,5 @@ app.listen(PORT, () => {
   console.log(`\n🚀 TaxPro Complete running on http://localhost:${PORT}`);
   console.log(`📋 Environment: ${process.env.NODE_ENV||"development"}\n`);
 });
-app.use("/api/accounting", require("./routes/accounting"));
 
 module.exports = app;
