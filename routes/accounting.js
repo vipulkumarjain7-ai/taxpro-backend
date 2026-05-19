@@ -519,3 +519,4 @@ router.post("/companies/:companyId/godowns", (req, res) => {
     res.status(201).json({ success:true, message:"Godown created" });
   } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 });
+module.exports = router;
