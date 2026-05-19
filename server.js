@@ -1,981 +1,783 @@
 require("dotenv").config();
-const express    = require("express");
-const cors       = require("cors");
-const jwt        = require("jsonwebtoken");
-const bcrypt     = require("bcryptjs");
+const express = require("express");
+const cors    = require("cors");
+const jwt     = require("jsonwebtoken");
+const bcrypt  = require("bcryptjs");
 const { v4: uuid } = require("uuid");
-const morgan     = require("morgan");
-const multer     = require("multer");
-const XLSX       = require("xlsx");
-const https      = require("https");
-const Database   = require("better-sqlite3");
-const path       = require("path");
+const morgan  = require("morgan");
+const multer  = require("multer");
+const XLSX    = require("xlsx");
+const https   = require("https");
+const { Pool }= require("pg");
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
 const JWT  = process.env.JWT_SECRET || "taxpro_secret_2024";
 
-// ── Database ───────────────────────────────────────────────────────────────
-const db = new Database(process.env.DB_PATH || "./taxpro.db");
-db.pragma("journal_mode = WAL");
-db.pragma("foreign_keys = ON");
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
+});
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL, firm_name TEXT, frn TEXT, role TEXT DEFAULT 'ca',
-    parent_id TEXT, created_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS clients (
-    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL,
-    gstin TEXT, state TEXT, type TEXT DEFAULT 'Trader', turnover TEXT,
-    status TEXT DEFAULT 'compliant', notes TEXT, phone TEXT, email TEXT,
-    address TEXT, city TEXT, pincode TEXT, pan TEXT, credit_limit REAL DEFAULT 0,
-    created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS notices (
-    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, client_id TEXT NOT NULL,
-    ref_no TEXT NOT NULL, type TEXT NOT NULL, issued_date TEXT NOT NULL,
-    due_date TEXT NOT NULL, amount REAL DEFAULT 0, status TEXT DEFAULT 'pending',
-    priority TEXT DEFAULT 'medium', description TEXT, reply_text TEXT,
-    created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS returns (
-    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, client_id TEXT NOT NULL,
-    period TEXT NOT NULL, gstr1_status TEXT DEFAULT 'not-filed',
-    gstr3b_status TEXT DEFAULT 'not-filed', gstr9_status TEXT DEFAULT 'not-filed',
-    gstr1_date TEXT, gstr3b_date TEXT, gstr9_date TEXT, notes TEXT,
-    created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')),
-    UNIQUE(user_id, client_id, period)
-  );
-  CREATE TABLE IF NOT EXISTS reconciliation (
-    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, client_id TEXT NOT NULL,
-    period TEXT NOT NULL, vendor_name TEXT NOT NULL, vendor_gstin TEXT NOT NULL,
-    invoice_count INTEGER DEFAULT 0, gstr2a_amount REAL DEFAULT 0,
-    gstr2b_amount REAL DEFAULT 0, books_amount REAL DEFAULT 0,
-    difference REAL DEFAULT 0, status TEXT DEFAULT 'pending', remarks TEXT,
-    created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS challans (
-    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, client_id TEXT NOT NULL,
-    challan_no TEXT NOT NULL, type TEXT NOT NULL, amount REAL DEFAULT 0,
-    period TEXT, payment_date TEXT, status TEXT DEFAULT 'paid', notes TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS products (
-    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL,
-    code TEXT, hsn_sac TEXT, unit TEXT DEFAULT 'PCS', category TEXT,
-    gst_rate REAL DEFAULT 18, purchase_price REAL DEFAULT 0,
-    sale_price REAL DEFAULT 0, stock_qty REAL DEFAULT 0, min_stock REAL DEFAULT 0,
-    description TEXT, is_service INTEGER DEFAULT 0,
-    created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS invoices (
-    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, invoice_no TEXT NOT NULL,
-    invoice_type TEXT DEFAULT 'SALES', party_id TEXT, party_name TEXT NOT NULL,
-    party_gstin TEXT, party_address TEXT, party_state TEXT,
-    invoice_date TEXT NOT NULL, due_date TEXT, place_of_supply TEXT,
-    is_igst INTEGER DEFAULT 0, subtotal REAL DEFAULT 0, discount REAL DEFAULT 0,
-    taxable_amount REAL DEFAULT 0, igst_amount REAL DEFAULT 0,
-    cgst_amount REAL DEFAULT 0, sgst_amount REAL DEFAULT 0,
-    cess_amount REAL DEFAULT 0, total_tax REAL DEFAULT 0,
-    total_amount REAL DEFAULT 0, paid_amount REAL DEFAULT 0,
-    balance_due REAL DEFAULT 0, status TEXT DEFAULT 'unpaid',
-    notes TEXT, terms TEXT, einvoice_irn TEXT,
-    created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS invoice_items (
-    id TEXT PRIMARY KEY, invoice_id TEXT NOT NULL, product_id TEXT,
-    name TEXT NOT NULL, hsn_sac TEXT, unit TEXT DEFAULT 'PCS',
-    qty REAL DEFAULT 1, rate REAL DEFAULT 0, discount_pct REAL DEFAULT 0,
-    taxable_value REAL DEFAULT 0, gst_rate REAL DEFAULT 18,
-    igst_amount REAL DEFAULT 0, cgst_amount REAL DEFAULT 0,
-    sgst_amount REAL DEFAULT 0, total_amount REAL DEFAULT 0
-  );
-  CREATE TABLE IF NOT EXISTS stock_movements (
-    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, product_id TEXT NOT NULL,
-    type TEXT NOT NULL, qty REAL NOT NULL, rate REAL DEFAULT 0,
-    reference TEXT, invoice_id TEXT, notes TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS payments (
-    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, invoice_id TEXT,
-    party_id TEXT, party_name TEXT, type TEXT DEFAULT 'RECEIVED',
-    amount REAL DEFAULT 0, method TEXT DEFAULT 'CASH', reference_no TEXT,
-    payment_date TEXT NOT NULL, notes TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS bank_transactions (
-    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, bank_name TEXT,
-    account_no TEXT, txn_date TEXT NOT NULL, description TEXT NOT NULL,
-    ref_no TEXT, debit REAL DEFAULT 0, credit REAL DEFAULT 0,
-    balance REAL DEFAULT 0, category TEXT DEFAULT 'Uncategorized',
-    sub_category TEXT, type TEXT DEFAULT 'UNKNOWN', is_reconciled INTEGER DEFAULT 0,
-    notes TEXT, import_id TEXT, created_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS bank_imports (
-    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, bank_name TEXT,
-    account_no TEXT, from_date TEXT, to_date TEXT, total_txns INTEGER DEFAULT 0,
-    total_debit REAL DEFAULT 0, total_credit REAL DEFAULT 0, filename TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-`);
+pool.connect((err, client, release) => {
+  if (err) { console.error("DB Error:", err.message); process.exit(1); }
+  release();
+  console.log("✅ PostgreSQL connected");
+});
 
-console.log("✅ Database initialised at", process.env.DB_PATH || "./taxpro.db");
+const initDB = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL, firm_name TEXT, frn TEXT, role TEXT DEFAULT 'ca',
+      parent_id TEXT, gstin TEXT, phone TEXT, logo_url TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS clients (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL,
+      gstin TEXT, state TEXT, type TEXT DEFAULT 'Trader', turnover TEXT,
+      status TEXT DEFAULT 'compliant', notes TEXT, phone TEXT, email TEXT,
+      address TEXT, city TEXT, pincode TEXT, pan TEXT, credit_limit REAL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS notices (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, client_id TEXT NOT NULL,
+      ref_no TEXT NOT NULL, type TEXT NOT NULL, issued_date TEXT NOT NULL,
+      due_date TEXT NOT NULL, amount REAL DEFAULT 0, status TEXT DEFAULT 'pending',
+      priority TEXT DEFAULT 'medium', description TEXT, reply_text TEXT,
+      created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS returns (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, client_id TEXT NOT NULL,
+      period TEXT NOT NULL, gstr1_status TEXT DEFAULT 'not-filed',
+      gstr3b_status TEXT DEFAULT 'not-filed', gstr9_status TEXT DEFAULT 'not-filed',
+      gstr1_date TEXT, gstr3b_date TEXT, gstr9_date TEXT, notes TEXT,
+      created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(user_id, client_id, period)
+    );
+    CREATE TABLE IF NOT EXISTS reconciliation (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, client_id TEXT NOT NULL,
+      period TEXT NOT NULL, vendor_name TEXT NOT NULL, vendor_gstin TEXT NOT NULL,
+      invoice_count INTEGER DEFAULT 0, gstr2a_amount REAL DEFAULT 0,
+      gstr2b_amount REAL DEFAULT 0, books_amount REAL DEFAULT 0,
+      difference REAL DEFAULT 0, status TEXT DEFAULT 'pending', remarks TEXT,
+      created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS challans (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, client_id TEXT NOT NULL,
+      challan_no TEXT NOT NULL, type TEXT NOT NULL, amount REAL DEFAULT 0,
+      period TEXT, payment_date TEXT, status TEXT DEFAULT 'paid', notes TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS products (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL,
+      code TEXT, hsn_sac TEXT, unit TEXT DEFAULT 'PCS', category TEXT,
+      gst_rate REAL DEFAULT 18, purchase_price REAL DEFAULT 0,
+      sale_price REAL DEFAULT 0, stock_qty REAL DEFAULT 0, min_stock REAL DEFAULT 0,
+      description TEXT, is_service BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS invoices (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, invoice_no TEXT NOT NULL,
+      invoice_type TEXT DEFAULT 'SALES', party_id TEXT, party_name TEXT NOT NULL,
+      party_gstin TEXT, party_address TEXT, party_state TEXT,
+      invoice_date TEXT NOT NULL, due_date TEXT, place_of_supply TEXT,
+      is_igst BOOLEAN DEFAULT FALSE, subtotal REAL DEFAULT 0,
+      taxable_amount REAL DEFAULT 0, igst_amount REAL DEFAULT 0,
+      cgst_amount REAL DEFAULT 0, sgst_amount REAL DEFAULT 0,
+      cess_amount REAL DEFAULT 0, total_tax REAL DEFAULT 0,
+      total_amount REAL DEFAULT 0, paid_amount REAL DEFAULT 0,
+      balance_due REAL DEFAULT 0, status TEXT DEFAULT 'unpaid',
+      notes TEXT, terms TEXT, einvoice_irn TEXT,
+      created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS invoice_items (
+      id TEXT PRIMARY KEY, invoice_id TEXT NOT NULL, product_id TEXT,
+      name TEXT NOT NULL, hsn_sac TEXT, unit TEXT DEFAULT 'PCS',
+      qty REAL DEFAULT 1, rate REAL DEFAULT 0, discount_pct REAL DEFAULT 0,
+      taxable_value REAL DEFAULT 0, gst_rate REAL DEFAULT 18,
+      igst_amount REAL DEFAULT 0, cgst_amount REAL DEFAULT 0,
+      sgst_amount REAL DEFAULT 0, total_amount REAL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS stock_movements (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, product_id TEXT NOT NULL,
+      type TEXT NOT NULL, qty REAL NOT NULL, rate REAL DEFAULT 0,
+      reference TEXT, invoice_id TEXT, notes TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS payments (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, invoice_id TEXT,
+      party_id TEXT, party_name TEXT, type TEXT DEFAULT 'RECEIVED',
+      amount REAL DEFAULT 0, method TEXT DEFAULT 'CASH', reference_no TEXT,
+      payment_date TEXT NOT NULL, notes TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS bank_transactions (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, bank_name TEXT,
+      account_no TEXT, txn_date TEXT NOT NULL, description TEXT NOT NULL,
+      ref_no TEXT, debit REAL DEFAULT 0, credit REAL DEFAULT 0,
+      balance REAL DEFAULT 0, category TEXT DEFAULT 'Uncategorized',
+      sub_category TEXT, type TEXT DEFAULT 'UNKNOWN',
+      is_reconciled BOOLEAN DEFAULT FALSE, notes TEXT, import_id TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS bank_imports (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, bank_name TEXT,
+      account_no TEXT, from_date TEXT, to_date TEXT,
+      total_txns INTEGER DEFAULT 0, total_debit REAL DEFAULT 0,
+      total_credit REAL DEFAULT 0, filename TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS companies (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL,
+      legal_name TEXT, gstin TEXT, pan TEXT, address TEXT, city TEXT,
+      state TEXT, pincode TEXT, phone TEXT, email TEXT,
+      financial_year TEXT DEFAULT 'Apr-Mar',
+      fy_start TEXT DEFAULT '2024-04-01', fy_end TEXT DEFAULT '2025-03-31',
+      currency TEXT DEFAULT 'INR', is_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS ledger_groups (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, company_id TEXT NOT NULL,
+      name TEXT NOT NULL, parent_id TEXT, nature TEXT NOT NULL,
+      affects_gross BOOLEAN DEFAULT FALSE, is_default BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS ledgers (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, company_id TEXT NOT NULL,
+      group_id TEXT NOT NULL, name TEXT NOT NULL, alias TEXT,
+      opening_balance REAL DEFAULT 0, opening_type TEXT DEFAULT 'Dr',
+      gstin TEXT, pan TEXT, address TEXT, phone TEXT, email TEXT,
+      bank_account TEXT, bank_name TEXT, ifsc_code TEXT,
+      credit_limit REAL DEFAULT 0, credit_days INTEGER DEFAULT 0,
+      is_default BOOLEAN DEFAULT FALSE, notes TEXT,
+      created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS vouchers (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, company_id TEXT NOT NULL,
+      voucher_no TEXT NOT NULL, voucher_type TEXT NOT NULL,
+      date TEXT NOT NULL, ref_no TEXT, narration TEXT,
+      party_ledger_id TEXT, party_name TEXT, total_amount REAL DEFAULT 0,
+      is_posted BOOLEAN DEFAULT TRUE, is_cancelled BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS voucher_items (
+      id TEXT PRIMARY KEY, voucher_id TEXT NOT NULL, ledger_id TEXT NOT NULL,
+      ledger_name TEXT NOT NULL, dr_amount REAL DEFAULT 0,
+      cr_amount REAL DEFAULT 0, narration TEXT, sort_order INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS godowns (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, company_id TEXT NOT NULL,
+      name TEXT NOT NULL, address TEXT, is_default BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  console.log("✅ All tables initialised");
+};
+initDB().catch(e => { console.error("Init Error:", e.message); process.exit(1); });
 
-// ── Migration: Add new columns to existing tables ──────────────────────────
-const migrations = [
-  ["clients",  "phone",        "TEXT"],
-  ["clients",  "email",        "TEXT"],
-  ["clients",  "address",      "TEXT"],
-  ["clients",  "city",         "TEXT"],
-  ["clients",  "pincode",      "TEXT"],
-  ["clients",  "pan",          "TEXT"],
-  ["clients",  "credit_limit", "REAL DEFAULT 0"],
-  ["users",    "parent_id",    "TEXT"],
-  ["users",    "gstin",        "TEXT"],
-  ["users",    "phone",        "TEXT"],
-  ["users",    "logo_url",     "TEXT"],
-  ["invoices", "cess_amount",  "REAL DEFAULT 0"],
-  ["invoices", "einvoice_irn", "TEXT"],
-  ["invoice_items", "discount_pct", "REAL DEFAULT 0"],
-];
-for (const [table, col, type] of migrations) {
-  try { db.prepare(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`).run(); }
-  catch(e) { /* column already exists — ignore */ }
-}
-console.log("✅ Database migration complete");
-
-// ── Middleware ─────────────────────────────────────────────────────────────
 app.use(cors({ origin:"*", methods:["GET","POST","PUT","PATCH","DELETE","OPTIONS"], allowedHeaders:["Content-Type","Authorization"] }));
 app.use(morgan("combined"));
 app.use(express.json({ limit:"10mb" }));
 app.use(express.urlencoded({ extended:true }));
+const upload = multer({ storage:multer.memoryStorage(), limits:{ fileSize:20*1024*1024 } });
 
-const upload = multer({ storage: multer.memoryStorage(), limits:{ fileSize:20*1024*1024 } });
-
-// ── Auth Middleware ────────────────────────────────────────────────────────
 const auth = (req, res, next) => {
   const h = req.headers.authorization;
-  if (!h || !h.startsWith("Bearer ")) return res.status(401).json({ success:false, message:"No token" });
+  if (!h?.startsWith("Bearer ")) return res.status(401).json({ success:false, message:"No token provided" });
   try { req.user = jwt.verify(h.split(" ")[1], JWT); next(); }
-  catch(e) { return res.status(401).json({ success:false, message:"Invalid token" }); }
+  catch(e) { return res.status(401).json({ success:false, message:"Invalid or expired token" }); }
 };
 
-// ── Helper: Groq AI call ───────────────────────────────────────────────────
 const callGroq = (messages, system) => new Promise((resolve) => {
-  if (!process.env.GROQ_API_KEY) return resolve("Groq API key not configured. Please add GROQ_API_KEY in Render environment variables.");
-  const postData = JSON.stringify({ model:"llama-3.3-70b-versatile", messages:[{ role:"system", content:system },...messages], max_tokens:1500 });
-  const options = { hostname:"api.groq.com", path:"/openai/v1/chat/completions", method:"POST", headers:{ "Content-Type":"application/json", "Authorization":`Bearer ${process.env.GROQ_API_KEY}`, "Content-Length":Buffer.byteLength(postData) } };
-  const req = https.request(options, (res) => {
+  if (!process.env.GROQ_API_KEY) return resolve("Add GROQ_API_KEY in Render environment variables.");
+  const postData = JSON.stringify({ model:"llama-3.3-70b-versatile", messages:[{ role:"system", content:system }, ...messages], max_tokens:1500 });
+  const req = https.request({ hostname:"api.groq.com", path:"/openai/v1/chat/completions", method:"POST", headers:{ "Content-Type":"application/json", "Authorization":`Bearer ${process.env.GROQ_API_KEY}`, "Content-Length":Buffer.byteLength(postData) } }, (res) => {
     let data=""; res.on("data",c=>{data+=c;}); res.on("end",()=>{
-      try { resolve(JSON.parse(data).choices?.[0]?.message?.content||"Sorry, could not process."); }
-      catch(e) { resolve("Error processing response."); }
+      try { resolve(JSON.parse(data).choices?.[0]?.message?.content||"Sorry."); } catch { resolve("Error."); }
     });
   });
-  req.on("error", ()=>resolve("Network error calling AI."));
-  req.setTimeout(30000, ()=>{ req.destroy(); resolve("Request timed out."); });
-  req.write(postData); req.end();
+  req.on("error",()=>resolve("Network error.")); req.setTimeout(30000,()=>{req.destroy();resolve("Timeout.");}); req.write(postData); req.end();
 });
 
-// ══════════════════════════════════════════════════════════════════════════
-// ── AUTH ROUTES ───────────────────────────────────────────────────────────
-// ══════════════════════════════════════════════════════════════════════════
-app.post("/api/auth/register", async (req, res) => {
-  try {
-    const { name, email, password, firm_name, frn } = req.body;
-    if (!name||!email||!password||!firm_name) return res.status(400).json({ success:false, message:"Name, email, password and firm name are required" });
-    if (password.length < 6) return res.status(400).json({ success:false, message:"Password must be at least 6 characters" });
-    const exists = db.prepare("SELECT id FROM users WHERE email=?").get(email.toLowerCase().trim());
-    if (exists) return res.status(409).json({ success:false, message:"Email already registered. Please login." });
-    const hashed = await bcrypt.hash(password, 12);
-    const id = uuid();
-    db.prepare("INSERT INTO users (id,name,email,password,firm_name,frn,role) VALUES (?,?,?,?,?,?,'ca')").run(id, name.trim(), email.toLowerCase().trim(), hashed, firm_name.trim(), frn||null);
-    const token = jwt.sign({ id, name:name.trim(), email:email.toLowerCase().trim(), firm_name:firm_name.trim(), role:"ca" }, JWT, { expiresIn:"7d" });
-    res.status(201).json({ success:true, token, user:{ id, name:name.trim(), email:email.toLowerCase().trim(), firm_name:firm_name.trim(), frn:frn||null, role:"ca" } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    if (!email||!password) return res.status(400).json({ success:false, message:"Email and password required" });
-    const user = db.prepare("SELECT * FROM users WHERE email=?").get(email.toLowerCase().trim());
-    if (!user) return res.status(401).json({ success:false, message:"Invalid email or password" });
-    const match = await bcrypt.compare(password, user.password);
-    if (!match) return res.status(401).json({ success:false, message:"Invalid email or password" });
-    const token = jwt.sign({ id:user.id, name:user.name, email:user.email, firm_name:user.firm_name, role:user.role }, JWT, { expiresIn:"7d" });
-    res.json({ success:true, token, user:{ id:user.id, name:user.name, email:user.email, firm_name:user.firm_name, frn:user.frn, role:user.role } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.get("/api/auth/me", auth, (req, res) => {
-  const user = db.prepare("SELECT id,name,email,firm_name,frn,role,created_at FROM users WHERE id=?").get(req.user.id);
-  if (!user) return res.status(404).json({ success:false, message:"User not found" });
-  res.json({ success:true, user });
-});
-
-// ══════════════════════════════════════════════════════════════════════════
-// ── DASHBOARD ─────────────────────────────────────────────────────────────
-// ══════════════════════════════════════════════════════════════════════════
-app.get("/api/dashboard", auth, (req, res) => {
-  try {
-    const uid = req.user.id;
-    const today = new Date().toISOString().split("T")[0];
-    const in30  = new Date(Date.now()+30*24*60*60*1000).toISOString().split("T")[0];
-    const totalC    = db.prepare("SELECT COUNT(*) as c FROM clients WHERE user_id=?").get(uid).c;
-    const compliant = db.prepare("SELECT COUNT(*) as c FROM clients WHERE user_id=? AND status='compliant'").get(uid).c;
-    const openN     = db.prepare("SELECT COUNT(*) as c FROM notices WHERE user_id=? AND status NOT IN ('closed','replied')").get(uid).c;
-    const due30     = db.prepare("SELECT COUNT(*) as c FROM notices WHERE user_id=? AND due_date BETWEEN ? AND ? AND status NOT IN ('closed','replied')").get(uid,today,in30).c;
-    const upcoming  = db.prepare("SELECT n.*,c.name as client_name FROM notices n JOIN clients c ON n.client_id=c.id WHERE n.user_id=? AND n.due_date BETWEEN ? AND ? AND n.status NOT IN ('closed','replied') ORDER BY n.due_date ASC LIMIT 5").all(uid,today,in30);
-    const recent    = db.prepare("SELECT * FROM clients WHERE user_id=? ORDER BY created_at DESC LIMIT 5").all(uid);
-    const lastPeriod = db.prepare("SELECT period FROM returns WHERE user_id=? ORDER BY period DESC LIMIT 1").get(uid);
-    let returnsSummary = null;
-    if (lastPeriod) {
-      const p = lastPeriod.period;
-      const count = (field, status) => db.prepare(`SELECT COUNT(*) as c FROM returns WHERE user_id=? AND period=? AND ${field}=?`).get(uid,p,status).c;
-      returnsSummary = { period:p, gstr1:{filed:count("gstr1_status","filed"),pending:count("gstr1_status","pending"),not_filed:count("gstr1_status","not-filed")}, gstr3b:{filed:count("gstr3b_status","filed"),pending:count("gstr3b_status","pending"),not_filed:count("gstr3b_status","not-filed")}, gstr9:{filed:count("gstr9_status","filed"),pending:count("gstr9_status","pending"),not_filed:count("gstr9_status","not-filed")} };
-    }
-    res.json({ success:true, dashboard:{ clients:{ total:totalC, compliant, pending:db.prepare("SELECT COUNT(*) as c FROM clients WHERE user_id=? AND status='pending'").get(uid).c, overdue:db.prepare("SELECT COUNT(*) as c FROM clients WHERE user_id=? AND status='overdue'").get(uid).c }, notices:{ open:openN, overdue:db.prepare("SELECT COUNT(*) as c FROM notices WHERE user_id=? AND status='overdue'").get(uid).c, due_in_30_days:due30 }, upcoming_notices:upcoming, recent_clients:recent, returns_summary:returnsSummary } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-// ══════════════════════════════════════════════════════════════════════════
-// ── CLIENTS ───────────────────────────────────────────────────────────────
-// ══════════════════════════════════════════════════════════════════════════
-app.get("/api/clients", auth, (req, res) => {
-  try {
-    const { search, status } = req.query;
-    let q = "SELECT c.*, (SELECT COUNT(*) FROM notices n WHERE n.client_id=c.id AND n.status NOT IN ('closed','replied')) as notice_count FROM clients c WHERE c.user_id=?";
-    const params = [req.user.id];
-    if (search) { q += " AND (c.name LIKE ? OR c.gstin LIKE ?)"; params.push(`%${search}%`,`%${search}%`); }
-    if (status) { q += " AND c.status=?"; params.push(status); }
-    q += " ORDER BY c.name ASC";
-    res.json({ success:true, clients:db.prepare(q).all(...params) });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.post("/api/clients", auth, (req, res) => {
-  try {
-    const { name, gstin, state, type, turnover, notes, phone, email, address, city, pincode, pan } = req.body;
-    if (!name) return res.status(400).json({ success:false, message:"Name is required" });
-    const id = uuid();
-    db.prepare("INSERT INTO clients (id,user_id,name,gstin,state,type,turnover,notes,phone,email,address,city,pincode,pan) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id,req.user.id,name,gstin?.toUpperCase()||null,state||null,type||"Trader",turnover||null,notes||null,phone||null,email||null,address||null,city||null,pincode||null,pan||null);
-    res.status(201).json({ success:true, message:"Client added", client:db.prepare("SELECT * FROM clients WHERE id=?").get(id) });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.put("/api/clients/:id", auth, (req, res) => {
-  try {
-    const c = db.prepare("SELECT id FROM clients WHERE id=? AND user_id=?").get(req.params.id,req.user.id);
-    if (!c) return res.status(404).json({ success:false, message:"Not found" });
-    const { name, gstin, state, type, turnover, notes, status, phone, email, address, city, pincode, pan } = req.body;
-    db.prepare("UPDATE clients SET name=?,gstin=?,state=?,type=?,turnover=?,notes=?,status=?,phone=?,email=?,address=?,city=?,pincode=?,pan=?,updated_at=datetime('now') WHERE id=?").run(name,gstin?.toUpperCase()||null,state||null,type||"Trader",turnover||null,notes||null,status||"compliant",phone||null,email||null,address||null,city||null,pincode||null,pan||null,req.params.id);
-    res.json({ success:true, message:"Updated", client:db.prepare("SELECT * FROM clients WHERE id=?").get(req.params.id) });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.delete("/api/clients/:id", auth, (req, res) => {
-  try {
-    const c = db.prepare("SELECT id FROM clients WHERE id=? AND user_id=?").get(req.params.id,req.user.id);
-    if (!c) return res.status(404).json({ success:false, message:"Not found" });
-    db.prepare("DELETE FROM clients WHERE id=?").run(req.params.id);
-    res.json({ success:true, message:"Deleted" });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-// ══════════════════════════════════════════════════════════════════════════
-// ── NOTICES ───────────────────────────────────────════════════════════════
-// ══════════════════════════════════════════════════════════════════════════
-app.get("/api/notices", auth, (req, res) => {
-  try {
-    const { status, client_id } = req.query;
-    let q = "SELECT n.*,c.name as client_name,c.gstin FROM notices n JOIN clients c ON n.client_id=c.id WHERE n.user_id=?";
-    const params = [req.user.id];
-    if (status && status!=="all") { q+=" AND n.status=?"; params.push(status); }
-    if (client_id) { q+=" AND n.client_id=?"; params.push(client_id); }
-    q+=" ORDER BY n.due_date ASC";
-    res.json({ success:true, notices:db.prepare(q).all(...params) });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.post("/api/notices", auth, (req, res) => {
-  try {
-    const { client_id, ref_no, type, issued_date, due_date, amount, priority, description } = req.body;
-    if (!client_id||!ref_no||!type||!issued_date||!due_date) return res.status(400).json({ success:false, message:"Required fields missing" });
-    const today = new Date().toISOString().split("T")[0];
-    const status = new Date(due_date) < new Date(today) ? "overdue" : "pending";
-    const id = uuid();
-    db.prepare("INSERT INTO notices (id,user_id,client_id,ref_no,type,issued_date,due_date,amount,status,priority,description) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(id,req.user.id,client_id,ref_no,type,issued_date,due_date,parseFloat(amount)||0,status,priority||"medium",description||null);
-    res.status(201).json({ success:true, message:"Notice added", notice:db.prepare("SELECT * FROM notices WHERE id=?").get(id) });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.patch("/api/notices/:id/status", auth, (req, res) => {
-  try {
-    db.prepare("UPDATE notices SET status=?,updated_at=datetime('now') WHERE id=? AND user_id=?").run(req.body.status,req.params.id,req.user.id);
-    res.json({ success:true, message:"Updated" });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.delete("/api/notices/:id", auth, (req, res) => {
-  try {
-    db.prepare("DELETE FROM notices WHERE id=? AND user_id=?").run(req.params.id,req.user.id);
-    res.json({ success:true, message:"Deleted" });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-// ══════════════════════════════════════════════════════════════════════════
-// ── RETURNS ───────────────────────────────────────────────────────────────
-// ══════════════════════════════════════════════════════════════════════════
-app.get("/api/returns", auth, (req, res) => {
-  try {
-    const { period, client_id } = req.query;
-    let q = "SELECT r.*,c.name as client_name,c.gstin FROM returns r JOIN clients c ON r.client_id=c.id WHERE r.user_id=?";
-    const params = [req.user.id];
-    if (period) { q+=" AND r.period=?"; params.push(period); }
-    if (client_id) { q+=" AND r.client_id=?"; params.push(client_id); }
-    q+=" ORDER BY c.name ASC";
-    res.json({ success:true, returns:db.prepare(q).all(...params) });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.post("/api/returns", auth, (req, res) => {
-  try {
-    const { client_id, period, gstr1_status, gstr3b_status, gstr9_status } = req.body;
-    if (!client_id||!period) return res.status(400).json({ success:false, message:"client_id and period required" });
-    const exists = db.prepare("SELECT id FROM returns WHERE user_id=? AND client_id=? AND period=?").get(req.user.id,client_id,period);
-    if (exists) return res.status(409).json({ success:false, message:"Record already exists for this period" });
-    const id = uuid();
-    db.prepare("INSERT INTO returns (id,user_id,client_id,period,gstr1_status,gstr3b_status,gstr9_status) VALUES (?,?,?,?,?,?,?)").run(id,req.user.id,client_id,period,gstr1_status||"not-filed",gstr3b_status||"not-filed",gstr9_status||"not-filed");
-    res.status(201).json({ success:true, message:"Saved", return:db.prepare("SELECT * FROM returns WHERE id=?").get(id) });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.put("/api/returns/:id", auth, (req, res) => {
-  try {
-    const { gstr1_status, gstr3b_status, gstr9_status } = req.body;
-    db.prepare("UPDATE returns SET gstr1_status=?,gstr3b_status=?,gstr9_status=?,updated_at=datetime('now') WHERE id=? AND user_id=?").run(gstr1_status,gstr3b_status,gstr9_status,req.params.id,req.user.id);
-    res.json({ success:true, message:"Updated" });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-// ══════════════════════════════════════════════════════════════════════════
-// ── RECONCILIATION ────────────────────────────────────────────────────────
-// ══════════════════════════════════════════════════════════════════════════
-app.get("/api/reconciliation", auth, (req, res) => {
-  try {
-    const { client_id, period } = req.query;
-    if (!client_id||!period) return res.status(400).json({ success:false, message:"client_id and period required" });
-    const rows = db.prepare("SELECT * FROM reconciliation WHERE user_id=? AND client_id=? AND period=? ORDER BY vendor_name ASC").all(req.user.id,client_id,period);
-    const matched  = rows.filter(r=>r.status==="matched").length;
-    const mismatch = rows.filter(r=>r.status==="mismatch").length;
-    const missing  = rows.filter(r=>r.status==="missing").length;
-    const totalRisk = rows.reduce((a,r)=>a+(r.difference||0),0);
-    res.json({ success:true, rows, summary:{ matched, mismatch, missing, total_itc_risk:totalRisk } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.post("/api/reconciliation", auth, (req, res) => {
-  try {
-    const { client_id, period, vendor_name, vendor_gstin, invoice_count, gstr2a_amount, gstr2b_amount, books_amount, remarks } = req.body;
-    const g2a=parseFloat(gstr2a_amount)||0, g2b=parseFloat(gstr2b_amount)||0, bks=parseFloat(books_amount)||0;
-    const diff = g2b - bks;
-    const status = g2b===0&&bks>0 ? "missing" : Math.abs(diff)>0 ? "mismatch" : "matched";
-    const id = uuid();
-    db.prepare("INSERT INTO reconciliation (id,user_id,client_id,period,vendor_name,vendor_gstin,invoice_count,gstr2a_amount,gstr2b_amount,books_amount,difference,status,remarks) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id,req.user.id,client_id,period,vendor_name,vendor_gstin?.toUpperCase()||"",parseInt(invoice_count)||0,g2a,g2b,bks,diff,status,remarks||null);
-    res.status(201).json({ success:true, message:"Added", row:db.prepare("SELECT * FROM reconciliation WHERE id=?").get(id) });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.delete("/api/reconciliation/:id", auth, (req, res) => {
-  try {
-    db.prepare("DELETE FROM reconciliation WHERE id=? AND user_id=?").run(req.params.id,req.user.id);
-    res.json({ success:true, message:"Deleted" });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-// ══════════════════════════════════════════════════════════════════════════
-// ── PRODUCTS ──────────────────────────────────────────────────────────────
-// ══════════════════════════════════════════════════════════════════════════
-app.get("/api/products", auth, (req, res) => {
-  try {
-    const { search } = req.query;
-    let q = "SELECT * FROM products WHERE user_id=?";
-    const params = [req.user.id];
-    if (search) { q+=" AND (name LIKE ? OR code LIKE ?)"; params.push(`%${search}%`,`%${search}%`); }
-    q+=" ORDER BY name ASC";
-    res.json({ success:true, products:db.prepare(q).all(...params) });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.post("/api/products", auth, (req, res) => {
-  try {
-    const { name, code, hsn_sac, unit, category, gst_rate, purchase_price, sale_price, stock_qty, min_stock, description, is_service } = req.body;
-    if (!name) return res.status(400).json({ success:false, message:"Product name required" });
-    const id = uuid();
-    db.prepare("INSERT INTO products (id,user_id,name,code,hsn_sac,unit,category,gst_rate,purchase_price,sale_price,stock_qty,min_stock,description,is_service) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id,req.user.id,name,code||null,hsn_sac||null,unit||"PCS",category||null,parseFloat(gst_rate)||18,parseFloat(purchase_price)||0,parseFloat(sale_price)||0,parseFloat(stock_qty)||0,parseFloat(min_stock)||0,description||null,is_service?1:0);
-    if (parseFloat(stock_qty)>0) db.prepare("INSERT INTO stock_movements (id,user_id,product_id,type,qty,rate,reference,notes) VALUES (?,?,?,'OPENING',?,?,'Opening Stock','Opening stock')").run(uuid(),req.user.id,id,parseFloat(stock_qty),parseFloat(purchase_price)||0);
-    res.status(201).json({ success:true, message:"Product added", product:db.prepare("SELECT * FROM products WHERE id=?").get(id) });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.put("/api/products/:id", auth, (req, res) => {
-  try {
-    const { name, code, hsn_sac, unit, category, gst_rate, purchase_price, sale_price, min_stock, description, is_service } = req.body;
-    db.prepare("UPDATE products SET name=?,code=?,hsn_sac=?,unit=?,category=?,gst_rate=?,purchase_price=?,sale_price=?,min_stock=?,description=?,is_service=?,updated_at=datetime('now') WHERE id=? AND user_id=?").run(name,code||null,hsn_sac||null,unit||"PCS",category||null,parseFloat(gst_rate)||18,parseFloat(purchase_price)||0,parseFloat(sale_price)||0,parseFloat(min_stock)||0,description||null,is_service?1:0,req.params.id,req.user.id);
-    res.json({ success:true, message:"Updated", product:db.prepare("SELECT * FROM products WHERE id=?").get(req.params.id) });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.delete("/api/products/:id", auth, (req, res) => {
-  try {
-    db.prepare("DELETE FROM products WHERE id=? AND user_id=?").run(req.params.id,req.user.id);
-    res.json({ success:true, message:"Deleted" });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.post("/api/products/:id/stock", auth, (req, res) => {
-  try {
-    const { type, qty, rate, notes } = req.body;
-    const p = db.prepare("SELECT * FROM products WHERE id=? AND user_id=?").get(req.params.id,req.user.id);
-    if (!p) return res.status(404).json({ success:false, message:"Product not found" });
-    const change = type==="IN" ? parseFloat(qty) : -parseFloat(qty);
-    const newStock = parseFloat(p.stock_qty) + change;
-    if (newStock < 0) return res.status(400).json({ success:false, message:"Insufficient stock" });
-    db.prepare("UPDATE products SET stock_qty=?,updated_at=datetime('now') WHERE id=?").run(newStock,req.params.id);
-    db.prepare("INSERT INTO stock_movements (id,user_id,product_id,type,qty,rate,notes) VALUES (?,?,?,?,?,?,?)").run(uuid(),req.user.id,req.params.id,type,Math.abs(parseFloat(qty)),parseFloat(rate)||0,notes||null);
-    res.json({ success:true, message:"Stock updated", new_stock:newStock });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-// ══════════════════════════════════════════════════════════════════════════
-// ── INVOICES ──────────────────────────────────────────────────────────────
-// ══════════════════════════════════════════════════════════════════════════
-const genInvNo = (userId, type) => {
+const genInvNo = async (userId, type) => {
   const prefix = type==="SALES"?"INV":type==="PURCHASE"?"PUR":"CN";
-  const yr = new Date().getFullYear().toString().slice(-2);
-  const mo = String(new Date().getMonth()+1).padStart(2,"0");
-  const cnt = db.prepare("SELECT COUNT(*) as c FROM invoices WHERE user_id=? AND invoice_type=?").get(userId,type).c + 1;
-  return `${prefix}/${yr}-${mo}/${String(cnt).padStart(4,"0")}`;
+  const yr=new Date().getFullYear().toString().slice(-2), mo=String(new Date().getMonth()+1).padStart(2,"0");
+  const r = await pool.query("SELECT COUNT(*) as c FROM invoices WHERE user_id=$1 AND invoice_type=$2",[userId,type]);
+  return `${prefix}/${yr}-${mo}/${String(parseInt(r.rows[0].c)+1).padStart(4,"0")}`;
 };
 
-app.get("/api/invoices", auth, (req, res) => {
-  try {
-    const { type, status, search } = req.query;
-    let q = "SELECT * FROM invoices WHERE user_id=?";
-    const params = [req.user.id];
-    if (type)   { q+=" AND invoice_type=?"; params.push(type); }
-    if (status) { q+=" AND status=?"; params.push(status); }
-    if (search) { q+=" AND (party_name LIKE ? OR invoice_no LIKE ?)"; params.push(`%${search}%`,`%${search}%`); }
-    q+=" ORDER BY created_at DESC";
-    const invoices = db.prepare(q).all(...params);
-    const totalAmount = invoices.reduce((a,i)=>a+(i.total_amount||0),0);
-    const totalPaid   = invoices.reduce((a,i)=>a+(i.paid_amount||0),0);
-    const totalOut    = invoices.reduce((a,i)=>a+(i.balance_due||0),0);
-    res.json({ success:true, count:invoices.length, invoices, summary:{ total_amount:totalAmount, total_paid:totalPaid, total_outstanding:totalOut } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
+const genVoucherNo = async (companyId, type) => {
+  const prefixes={SALES:"SI",PURCHASE:"PI",RECEIPT:"RC",PAYMENT:"PY",CONTRA:"CT",JOURNAL:"JV"};
+  const prefix=prefixes[type]||"VR", yr=new Date().getFullYear().toString().slice(-2), mo=String(new Date().getMonth()+1).padStart(2,"0");
+  const r = await pool.query("SELECT COUNT(*) as c FROM vouchers WHERE company_id=$1 AND voucher_type=$2",[companyId,type]);
+  return `${prefix}/${yr}-${mo}/${String(parseInt(r.rows[0].c)+1).padStart(4,"0")}`;
+};
+const DEFAULT_GROUPS = [
+  {name:"Capital Account",nature:"Liability",parent:null,ag:false},
+  {name:"Reserves & Surplus",nature:"Liability",parent:"Capital Account",ag:false},
+  {name:"Loans (Liability)",nature:"Liability",parent:null,ag:false},
+  {name:"Secured Loans",nature:"Liability",parent:"Loans (Liability)",ag:false},
+  {name:"Unsecured Loans",nature:"Liability",parent:"Loans (Liability)",ag:false},
+  {name:"Current Liabilities",nature:"Liability",parent:null,ag:false},
+  {name:"Sundry Creditors",nature:"Liability",parent:"Current Liabilities",ag:false},
+  {name:"Duties & Taxes",nature:"Liability",parent:"Current Liabilities",ag:false},
+  {name:"Provisions",nature:"Liability",parent:"Current Liabilities",ag:false},
+  {name:"Fixed Assets",nature:"Asset",parent:null,ag:false},
+  {name:"Investments",nature:"Asset",parent:null,ag:false},
+  {name:"Current Assets",nature:"Asset",parent:null,ag:false},
+  {name:"Sundry Debtors",nature:"Asset",parent:"Current Assets",ag:false},
+  {name:"Cash-in-Hand",nature:"Asset",parent:"Current Assets",ag:false},
+  {name:"Bank Accounts",nature:"Asset",parent:"Current Assets",ag:false},
+  {name:"Stock-in-Hand",nature:"Asset",parent:"Current Assets",ag:false},
+  {name:"Loans & Advances (Asset)",nature:"Asset",parent:"Current Assets",ag:false},
+  {name:"Sales Accounts",nature:"Income",parent:null,ag:true},
+  {name:"Direct Income",nature:"Income",parent:null,ag:true},
+  {name:"Indirect Income",nature:"Income",parent:null,ag:false},
+  {name:"Purchase Accounts",nature:"Expense",parent:null,ag:true},
+  {name:"Direct Expenses",nature:"Expense",parent:null,ag:true},
+  {name:"Indirect Expenses",nature:"Expense",parent:null,ag:false},
+  {name:"Manufacturing Expenses",nature:"Expense",parent:null,ag:true},
+];
 
-app.get("/api/invoices/stats/summary", auth, (req, res) => {
-  try {
-    const uid = req.user.id;
-    const today = new Date().toISOString().split("T")[0];
-    const month = today.substring(0,7);
-    const sales    = db.prepare("SELECT COALESCE(SUM(total_amount),0) as total FROM invoices WHERE user_id=? AND invoice_type='SALES' AND invoice_date LIKE ?").get(uid,`${month}%`).total;
-    const purchases= db.prepare("SELECT COALESCE(SUM(total_amount),0) as total FROM invoices WHERE user_id=? AND invoice_type='PURCHASE' AND invoice_date LIKE ?").get(uid,`${month}%`).total;
-    const outstanding=db.prepare("SELECT COALESCE(SUM(balance_due),0) as total FROM invoices WHERE user_id=? AND status IN ('unpaid','partial')").get(uid).total;
-    const overdue  = db.prepare("SELECT COALESCE(SUM(balance_due),0) as total FROM invoices WHERE user_id=? AND status IN ('unpaid','partial') AND due_date < ?").get(uid,today).total;
-    res.json({ success:true, stats:{ monthly_sales:sales, monthly_purchases:purchases, total_outstanding:outstanding, overdue_amount:overdue } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
+const DEFAULT_LEDGERS = [
+  {name:"Cash",group:"Cash-in-Hand",ob:0,ot:"Dr"},
+  {name:"Capital",group:"Capital Account",ob:0,ot:"Cr"},
+  {name:"Sales",group:"Sales Accounts",ob:0,ot:"Cr"},
+  {name:"Purchase",group:"Purchase Accounts",ob:0,ot:"Dr"},
+  {name:"CGST Payable",group:"Duties & Taxes",ob:0,ot:"Cr"},
+  {name:"SGST Payable",group:"Duties & Taxes",ob:0,ot:"Cr"},
+  {name:"IGST Payable",group:"Duties & Taxes",ob:0,ot:"Cr"},
+  {name:"CGST Input Credit",group:"Current Assets",ob:0,ot:"Dr"},
+  {name:"SGST Input Credit",group:"Current Assets",ob:0,ot:"Dr"},
+  {name:"IGST Input Credit",group:"Current Assets",ob:0,ot:"Dr"},
+  {name:"Salary & Wages",group:"Indirect Expenses",ob:0,ot:"Dr"},
+  {name:"Rent",group:"Indirect Expenses",ob:0,ot:"Dr"},
+  {name:"Electricity Charges",group:"Indirect Expenses",ob:0,ot:"Dr"},
+  {name:"Discount Allowed",group:"Indirect Expenses",ob:0,ot:"Dr"},
+  {name:"Discount Received",group:"Indirect Income",ob:0,ot:"Cr"},
+  {name:"Freight & Cartage",group:"Direct Expenses",ob:0,ot:"Dr"},
+  {name:"TDS Payable",group:"Duties & Taxes",ob:0,ot:"Cr"},
+  {name:"Commission Income",group:"Indirect Income",ob:0,ot:"Cr"},
+];
 
-app.get("/api/invoices/:id", auth, (req, res) => {
-  try {
-    const inv = db.prepare("SELECT * FROM invoices WHERE id=? AND user_id=?").get(req.params.id,req.user.id);
-    if (!inv) return res.status(404).json({ success:false, message:"Not found" });
-    const items    = db.prepare("SELECT * FROM invoice_items WHERE invoice_id=?").all(req.params.id);
-    const payments = db.prepare("SELECT * FROM payments WHERE invoice_id=?").all(req.params.id);
-    res.json({ success:true, invoice:{ ...inv, items, payments } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
+const createDefaultAccounting = async (companyId, userId) => {
+  const groupMap = {};
+  for (const g of DEFAULT_GROUPS) {
+    const id = uuid();
+    await pool.query("INSERT INTO ledger_groups (id,user_id,company_id,name,nature,affects_gross,is_default) VALUES ($1,$2,$3,$4,$5,$6,TRUE) ON CONFLICT DO NOTHING",
+      [id,userId,companyId,g.name,g.nature,g.ag]);
+    const r = await pool.query("SELECT id FROM ledger_groups WHERE company_id=$1 AND name=$2",[companyId,g.name]);
+    if (r.rows[0]) groupMap[g.name] = r.rows[0].id;
+  }
+  for (const g of DEFAULT_GROUPS) {
+    if (g.parent && groupMap[g.parent] && groupMap[g.name]) {
+      await pool.query("UPDATE ledger_groups SET parent_id=$1 WHERE id=$2",[groupMap[g.parent],groupMap[g.name]]);
+    }
+  }
+  for (const l of DEFAULT_LEDGERS) {
+    const gid = groupMap[l.group];
+    if (!gid) continue;
+    await pool.query("INSERT INTO ledgers (id,user_id,company_id,group_id,name,opening_balance,opening_type,is_default) VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE) ON CONFLICT DO NOTHING",
+      [uuid(),userId,companyId,gid,l.name,l.ob,l.ot]);
+  }
+};
 
-app.post("/api/invoices", auth, (req, res) => {
-  try {
-    const { invoice_type, party_id, party_name, party_gstin, party_address, party_state, invoice_date, due_date, place_of_supply, is_igst, notes, terms, items=[] } = req.body;
-    if (!party_name) return res.status(400).json({ success:false, message:"Party name required" });
-    if (!invoice_date) return res.status(400).json({ success:false, message:"Invoice date required" });
-    if (items.length===0) return res.status(400).json({ success:false, message:"At least one item required" });
+const getLedgerBalance = async (ledgerId, toDate) => {
+  let q="SELECT COALESCE(SUM(dr_amount),0) as dr,COALESCE(SUM(cr_amount),0) as cr FROM voucher_items vi JOIN vouchers v ON vi.voucher_id=v.id WHERE vi.ledger_id=$1 AND v.is_cancelled=FALSE";
+  const p=[ledgerId];
+  if(toDate){q+=` AND v.date<=$${p.length+1}`;p.push(toDate);}
+  const r=await pool.query(q,p);
+  return r.rows[0];
+};
 
-    const invoice_no = genInvNo(req.user.id, invoice_type||"SALES");
-    let subtotal=0, totalIGST=0, totalCGST=0, totalSGST=0;
-
-    const processedItems = items.map(item => {
-      const qty=parseFloat(item.qty)||0, rate=parseFloat(item.rate)||0, disc=parseFloat(item.discount_pct)||0, gstRate=parseFloat(item.gst_rate)||0;
-      const gross=qty*rate, discAmt=gross*disc/100, taxable=gross-discAmt;
-      const igst=is_igst?taxable*gstRate/100:0;
-      const cgst=!is_igst?taxable*(gstRate/2)/100:0;
-      const sgst=!is_igst?taxable*(gstRate/2)/100:0;
-      subtotal+=gross; totalIGST+=igst; totalCGST+=cgst; totalSGST+=sgst;
-      return { ...item, taxable_value:taxable, igst_amount:igst, cgst_amount:cgst, sgst_amount:sgst, total_amount:taxable+igst+cgst+sgst };
-    });
-
-    const totalTax=totalIGST+totalCGST+totalSGST;
-    const totalAmount=subtotal+totalTax;
+// ══ AUTH ══
+app.post("/api/auth/register", async (req,res)=>{
+  try{
+    const{name,email,password,firm_name,frn}=req.body;
+    if(!name||!email||!password||!firm_name) return res.status(400).json({success:false,message:"Name, email, password and firm name required"});
+    if(password.length<6) return res.status(400).json({success:false,message:"Password min 6 characters"});
+    const exists=await pool.query("SELECT id FROM users WHERE email=$1",[email.toLowerCase().trim()]);
+    if(exists.rows[0]) return res.status(409).json({success:false,message:"Email already registered. Please login."});
+    const hashed=await bcrypt.hash(password,12);
     const id=uuid();
+    await pool.query("INSERT INTO users (id,name,email,password,firm_name,frn,role) VALUES ($1,$2,$3,$4,$5,$6,'ca')",[id,name.trim(),email.toLowerCase().trim(),hashed,firm_name.trim(),frn||null]);
+    const token=jwt.sign({id,name:name.trim(),email:email.toLowerCase().trim(),firm_name:firm_name.trim(),role:"ca"},JWT,{expiresIn:"7d"});
+    res.status(201).json({success:true,token,user:{id,name:name.trim(),email:email.toLowerCase().trim(),firm_name:firm_name.trim(),role:"ca"}});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
 
-    db.prepare("INSERT INTO invoices (id,user_id,invoice_no,invoice_type,party_id,party_name,party_gstin,party_address,party_state,invoice_date,due_date,place_of_supply,is_igst,subtotal,taxable_amount,igst_amount,cgst_amount,sgst_amount,total_tax,total_amount,paid_amount,balance_due,status,notes,terms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?)").run(id,req.user.id,invoice_no,invoice_type||"SALES",party_id||null,party_name,party_gstin||null,party_address||null,party_state||null,invoice_date,due_date||null,place_of_supply||null,is_igst?1:0,subtotal,subtotal,totalIGST,totalCGST,totalSGST,totalTax,totalAmount,totalAmount,"unpaid",notes||null,terms||null);
+app.post("/api/auth/login", async (req,res)=>{
+  try{
+    const{email,password}=req.body;
+    if(!email||!password) return res.status(400).json({success:false,message:"Email and password required"});
+    const r=await pool.query("SELECT * FROM users WHERE email=$1",[email.toLowerCase().trim()]);
+    const user=r.rows[0];
+    if(!user) return res.status(401).json({success:false,message:"Invalid email or password"});
+    const match=await bcrypt.compare(password,user.password);
+    if(!match) return res.status(401).json({success:false,message:"Invalid email or password"});
+    const token=jwt.sign({id:user.id,name:user.name,email:user.email,firm_name:user.firm_name,role:user.role},JWT,{expiresIn:"7d"});
+    res.json({success:true,token,user:{id:user.id,name:user.name,email:user.email,firm_name:user.firm_name,frn:user.frn,role:user.role}});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
 
-    for (const item of processedItems) {
-      db.prepare("INSERT INTO invoice_items (id,invoice_id,product_id,name,hsn_sac,unit,qty,rate,discount_pct,taxable_value,gst_rate,igst_amount,cgst_amount,sgst_amount,total_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(uuid(),id,item.product_id||null,item.name,item.hsn_sac||null,item.unit||"PCS",item.qty,item.rate,item.discount_pct||0,item.taxable_value,item.gst_rate||0,item.igst_amount,item.cgst_amount,item.sgst_amount,item.total_amount);
-      if (item.product_id) {
-        const stockChange = (invoice_type==="SALES") ? -parseFloat(item.qty) : parseFloat(item.qty);
-        const p = db.prepare("SELECT stock_qty FROM products WHERE id=?").get(item.product_id);
-        if (p) {
-          const newStock = Math.max(0, parseFloat(p.stock_qty)+stockChange);
-          db.prepare("UPDATE products SET stock_qty=?,updated_at=datetime('now') WHERE id=?").run(newStock,item.product_id);
-          db.prepare("INSERT INTO stock_movements (id,user_id,product_id,type,qty,rate,reference,invoice_id,notes) VALUES (?,?,?,?,?,?,?,?,?)").run(uuid(),req.user.id,item.product_id,invoice_type==="SALES"?"OUT":"IN",Math.abs(parseFloat(item.qty)),item.rate,invoice_no,id,`${invoice_type} Invoice`);
-        }
+app.get("/api/auth/me", auth, async(req,res)=>{
+  try{
+    const r=await pool.query("SELECT id,name,email,firm_name,frn,role FROM users WHERE id=$1",[req.user.id]);
+    res.json({success:true,user:r.rows[0]});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ══ DASHBOARD ══
+app.get("/api/dashboard", auth, async(req,res)=>{
+  try{
+    const uid=req.user.id, today=new Date().toISOString().split("T")[0];
+    const in30=new Date(Date.now()+30*24*60*60*1000).toISOString().split("T")[0];
+    const [tC,cC,pC,oC,oN,dN,upN,rC,lP]=await Promise.all([
+      pool.query("SELECT COUNT(*) as c FROM clients WHERE user_id=$1",[uid]),
+      pool.query("SELECT COUNT(*) as c FROM clients WHERE user_id=$1 AND status='compliant'",[uid]),
+      pool.query("SELECT COUNT(*) as c FROM clients WHERE user_id=$1 AND status='pending'",[uid]),
+      pool.query("SELECT COUNT(*) as c FROM clients WHERE user_id=$1 AND status='overdue'",[uid]),
+      pool.query("SELECT COUNT(*) as c FROM notices WHERE user_id=$1 AND status NOT IN ('closed','replied')",[uid]),
+      pool.query("SELECT COUNT(*) as c FROM notices WHERE user_id=$1 AND due_date BETWEEN $2 AND $3 AND status NOT IN ('closed','replied')",[uid,today,in30]),
+      pool.query("SELECT n.*,c.name as client_name FROM notices n JOIN clients c ON n.client_id=c.id WHERE n.user_id=$1 AND n.due_date BETWEEN $2 AND $3 AND n.status NOT IN ('closed','replied') ORDER BY n.due_date ASC LIMIT 5",[uid,today,in30]),
+      pool.query("SELECT * FROM clients WHERE user_id=$1 ORDER BY created_at DESC LIMIT 5",[uid]),
+      pool.query("SELECT period FROM returns WHERE user_id=$1 ORDER BY period DESC LIMIT 1",[uid]),
+    ]);
+    let rs=null;
+    if(lP.rows[0]){
+      const p=lP.rows[0].period;
+      const c=async(f,s)=>{const r=await pool.query(`SELECT COUNT(*) as c FROM returns WHERE user_id=$1 AND period=$2 AND ${f}=$3`,[uid,p,s]);return parseInt(r.rows[0].c);};
+      rs={period:p,gstr1:{filed:await c("gstr1_status","filed"),pending:await c("gstr1_status","pending"),not_filed:await c("gstr1_status","not-filed")},gstr3b:{filed:await c("gstr3b_status","filed"),pending:await c("gstr3b_status","pending"),not_filed:await c("gstr3b_status","not-filed")},gstr9:{filed:await c("gstr9_status","filed"),pending:await c("gstr9_status","pending"),not_filed:await c("gstr9_status","not-filed")}};
+    }
+    res.json({success:true,dashboard:{clients:{total:parseInt(tC.rows[0].c),compliant:parseInt(cC.rows[0].c),pending:parseInt(pC.rows[0].c),overdue:parseInt(oC.rows[0].c)},notices:{open:parseInt(oN.rows[0].c),due_in_30_days:parseInt(dN.rows[0].c)},upcoming_notices:upN.rows,recent_clients:rC.rows,returns_summary:rs}});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ══ CLIENTS ══
+app.get("/api/clients",auth,async(req,res)=>{
+  try{const{search,status}=req.query;let q="SELECT c.*,(SELECT COUNT(*) FROM notices n WHERE n.client_id=c.id AND n.status NOT IN ('closed','replied')) as notice_count FROM clients c WHERE c.user_id=$1";const p=[req.user.id];if(search){q+=` AND (c.name ILIKE $${p.length+1} OR c.gstin ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}if(status){q+=` AND c.status=$${p.length+1}`;p.push(status);}q+=" ORDER BY c.name ASC";const r=await pool.query(q,p);res.json({success:true,clients:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/clients",auth,async(req,res)=>{
+  try{const{name,gstin,state,type,turnover,notes,phone,email,address,city,pincode,pan}=req.body;if(!name)return res.status(400).json({success:false,message:"Name required"});const id=uuid();await pool.query("INSERT INTO clients (id,user_id,name,gstin,state,type,turnover,notes,phone,email,address,city,pincode,pan) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",[id,req.user.id,name,gstin?.toUpperCase()||null,state||null,type||"Trader",turnover||null,notes||null,phone||null,email||null,address||null,city||null,pincode||null,pan||null]);const r=await pool.query("SELECT * FROM clients WHERE id=$1",[id]);res.status(201).json({success:true,message:"Client added",client:r.rows[0]});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.put("/api/clients/:id",auth,async(req,res)=>{
+  try{const{name,gstin,state,type,turnover,notes,status,phone,email,address,city,pincode,pan}=req.body;await pool.query("UPDATE clients SET name=$1,gstin=$2,state=$3,type=$4,turnover=$5,notes=$6,status=$7,phone=$8,email=$9,address=$10,city=$11,pincode=$12,pan=$13,updated_at=NOW() WHERE id=$14 AND user_id=$15",[name,gstin?.toUpperCase()||null,state||null,type||"Trader",turnover||null,notes||null,status||"compliant",phone||null,email||null,address||null,city||null,pincode||null,pan||null,req.params.id,req.user.id]);res.json({success:true,message:"Updated"});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.delete("/api/clients/:id",auth,async(req,res)=>{
+  try{await pool.query("DELETE FROM clients WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);res.json({success:true,message:"Deleted"});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ══ NOTICES ══
+app.get("/api/notices",auth,async(req,res)=>{
+  try{const{status,client_id}=req.query;let q="SELECT n.*,c.name as client_name,c.gstin FROM notices n JOIN clients c ON n.client_id=c.id WHERE n.user_id=$1";const p=[req.user.id];if(status&&status!=="all"){q+=` AND n.status=$${p.length+1}`;p.push(status);}if(client_id){q+=` AND n.client_id=$${p.length+1}`;p.push(client_id);}q+=" ORDER BY n.due_date ASC";const r=await pool.query(q,p);res.json({success:true,notices:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/notices",auth,async(req,res)=>{
+  try{const{client_id,ref_no,type,issued_date,due_date,amount,priority,description}=req.body;if(!client_id||!ref_no||!type||!due_date)return res.status(400).json({success:false,message:"Required fields missing"});const today=new Date().toISOString().split("T")[0];const status=new Date(due_date)<new Date(today)?"overdue":"pending";const id=uuid();await pool.query("INSERT INTO notices (id,user_id,client_id,ref_no,type,issued_date,due_date,amount,status,priority,description) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",[id,req.user.id,client_id,ref_no,type,issued_date||today,due_date,parseFloat(amount)||0,status,priority||"medium",description||null]);const r=await pool.query("SELECT * FROM notices WHERE id=$1",[id]);res.status(201).json({success:true,message:"Notice added",notice:r.rows[0]});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.patch("/api/notices/:id/status",auth,async(req,res)=>{
+  try{await pool.query("UPDATE notices SET status=$1,updated_at=NOW() WHERE id=$2 AND user_id=$3",[req.body.status,req.params.id,req.user.id]);res.json({success:true,message:"Updated"});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.delete("/api/notices/:id",auth,async(req,res)=>{
+  try{await pool.query("DELETE FROM notices WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);res.json({success:true,message:"Deleted"});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ══ RETURNS ══
+app.get("/api/returns",auth,async(req,res)=>{
+  try{const{period,client_id}=req.query;let q="SELECT r.*,c.name as client_name,c.gstin FROM returns r JOIN clients c ON r.client_id=c.id WHERE r.user_id=$1";const p=[req.user.id];if(period){q+=` AND r.period=$${p.length+1}`;p.push(period);}if(client_id){q+=` AND r.client_id=$${p.length+1}`;p.push(client_id);}q+=" ORDER BY c.name ASC";const r=await pool.query(q,p);res.json({success:true,returns:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/returns",auth,async(req,res)=>{
+  try{const{client_id,period,gstr1_status,gstr3b_status,gstr9_status}=req.body;if(!client_id||!period)return res.status(400).json({success:false,message:"client_id and period required"});const ex=await pool.query("SELECT id FROM returns WHERE user_id=$1 AND client_id=$2 AND period=$3",[req.user.id,client_id,period]);if(ex.rows[0])return res.status(409).json({success:false,message:"Record exists for this period"});const id=uuid();await pool.query("INSERT INTO returns (id,user_id,client_id,period,gstr1_status,gstr3b_status,gstr9_status) VALUES ($1,$2,$3,$4,$5,$6,$7)",[id,req.user.id,client_id,period,gstr1_status||"not-filed",gstr3b_status||"not-filed",gstr9_status||"not-filed"]);res.status(201).json({success:true,message:"Saved"});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.put("/api/returns/:id",auth,async(req,res)=>{
+  try{const{gstr1_status,gstr3b_status,gstr9_status}=req.body;await pool.query("UPDATE returns SET gstr1_status=$1,gstr3b_status=$2,gstr9_status=$3,updated_at=NOW() WHERE id=$4 AND user_id=$5",[gstr1_status,gstr3b_status,gstr9_status,req.params.id,req.user.id]);res.json({success:true,message:"Updated"});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.delete("/api/returns/:id",auth,async(req,res)=>{
+  try{await pool.query("DELETE FROM returns WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);res.json({success:true,message:"Deleted"});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ══ RECONCILIATION ══
+app.get("/api/reconciliation",auth,async(req,res)=>{
+  try{const{client_id,period}=req.query;if(!client_id||!period)return res.status(400).json({success:false,message:"client_id and period required"});const r=await pool.query("SELECT * FROM reconciliation WHERE user_id=$1 AND client_id=$2 AND period=$3 ORDER BY vendor_name ASC",[req.user.id,client_id,period]);const rows=r.rows;const matched=rows.filter(r=>r.status==="matched").length,mismatch=rows.filter(r=>r.status==="mismatch").length,missing=rows.filter(r=>r.status==="missing").length,totalRisk=rows.reduce((a,r)=>a+parseFloat(r.difference||0),0);res.json({success:true,rows,summary:{matched,mismatch,missing,total_itc_risk:totalRisk}});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/reconciliation",auth,async(req,res)=>{
+  try{const{client_id,period,vendor_name,vendor_gstin,invoice_count,gstr2a_amount,gstr2b_amount,books_amount,remarks}=req.body;const g2a=parseFloat(gstr2a_amount)||0,g2b=parseFloat(gstr2b_amount)||0,bks=parseFloat(books_amount)||0,diff=g2b-bks;const status=g2b===0&&bks>0?"missing":Math.abs(diff)>0?"mismatch":"matched";const id=uuid();await pool.query("INSERT INTO reconciliation (id,user_id,client_id,period,vendor_name,vendor_gstin,invoice_count,gstr2a_amount,gstr2b_amount,books_amount,difference,status,remarks) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",[id,req.user.id,client_id,period,vendor_name,vendor_gstin?.toUpperCase()||"",parseInt(invoice_count)||0,g2a,g2b,bks,diff,status,remarks||null]);res.status(201).json({success:true,message:"Added"});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.delete("/api/reconciliation/:id",auth,async(req,res)=>{
+  try{await pool.query("DELETE FROM reconciliation WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);res.json({success:true,message:"Deleted"});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ══ PRODUCTS ══
+app.get("/api/products",auth,async(req,res)=>{
+  try{const{search}=req.query;let q="SELECT * FROM products WHERE user_id=$1";const p=[req.user.id];if(search){q+=` AND (name ILIKE $${p.length+1} OR code ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}q+=" ORDER BY name ASC";const r=await pool.query(q,p);res.json({success:true,products:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/products",auth,async(req,res)=>{
+  try{const{name,code,hsn_sac,unit,category,gst_rate,purchase_price,sale_price,stock_qty,min_stock,description,is_service}=req.body;if(!name)return res.status(400).json({success:false,message:"Name required"});const id=uuid();await pool.query("INSERT INTO products (id,user_id,name,code,hsn_sac,unit,category,gst_rate,purchase_price,sale_price,stock_qty,min_stock,description,is_service) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",[id,req.user.id,name,code||null,hsn_sac||null,unit||"PCS",category||null,parseFloat(gst_rate)||18,parseFloat(purchase_price)||0,parseFloat(sale_price)||0,parseFloat(stock_qty)||0,parseFloat(min_stock)||0,description||null,is_service||false]);if(parseFloat(stock_qty)>0)await pool.query("INSERT INTO stock_movements (id,user_id,product_id,type,qty,rate,reference,notes) VALUES ($1,$2,$3,'OPENING',$4,$5,'Opening Stock','Opening stock')",[uuid(),req.user.id,id,parseFloat(stock_qty),parseFloat(purchase_price)||0]);const r=await pool.query("SELECT * FROM products WHERE id=$1",[id]);res.status(201).json({success:true,message:"Product added",product:r.rows[0]});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.put("/api/products/:id",auth,async(req,res)=>{
+  try{const{name,code,hsn_sac,unit,category,gst_rate,purchase_price,sale_price,min_stock,description,is_service}=req.body;await pool.query("UPDATE products SET name=$1,code=$2,hsn_sac=$3,unit=$4,category=$5,gst_rate=$6,purchase_price=$7,sale_price=$8,min_stock=$9,description=$10,is_service=$11,updated_at=NOW() WHERE id=$12 AND user_id=$13",[name,code||null,hsn_sac||null,unit||"PCS",category||null,parseFloat(gst_rate)||18,parseFloat(purchase_price)||0,parseFloat(sale_price)||0,parseFloat(min_stock)||0,description||null,is_service||false,req.params.id,req.user.id]);res.json({success:true,message:"Updated"});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.delete("/api/products/:id",auth,async(req,res)=>{
+  try{await pool.query("DELETE FROM products WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);res.json({success:true,message:"Deleted"});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/products/:id/stock",auth,async(req,res)=>{
+  try{const{type,qty,rate,notes}=req.body;const p=await pool.query("SELECT * FROM products WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);if(!p.rows[0])return res.status(404).json({success:false,message:"Not found"});const change=type==="IN"?parseFloat(qty):-parseFloat(qty);const newStock=parseFloat(p.rows[0].stock_qty)+change;if(newStock<0)return res.status(400).json({success:false,message:"Insufficient stock"});await pool.query("UPDATE products SET stock_qty=$1,updated_at=NOW() WHERE id=$2",[newStock,req.params.id]);await pool.query("INSERT INTO stock_movements (id,user_id,product_id,type,qty,rate,notes) VALUES ($1,$2,$3,$4,$5,$6,$7)",[uuid(),req.user.id,req.params.id,type,Math.abs(parseFloat(qty)),parseFloat(rate)||0,notes||null]);res.json({success:true,message:"Stock updated",new_stock:newStock});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+// ══ INVOICES ══
+app.get("/api/invoices/stats/summary",auth,async(req,res)=>{
+  try{const uid=req.user.id,today=new Date().toISOString().split("T")[0],month=today.substring(0,7);const[s,p,o,ov]=await Promise.all([pool.query("SELECT COALESCE(SUM(total_amount),0) as t FROM invoices WHERE user_id=$1 AND invoice_type='SALES' AND invoice_date LIKE $2",[uid,`${month}%`]),pool.query("SELECT COALESCE(SUM(total_amount),0) as t FROM invoices WHERE user_id=$1 AND invoice_type='PURCHASE' AND invoice_date LIKE $2",[uid,`${month}%`]),pool.query("SELECT COALESCE(SUM(balance_due),0) as t FROM invoices WHERE user_id=$1 AND status IN ('unpaid','partial')",[uid]),pool.query("SELECT COALESCE(SUM(balance_due),0) as t FROM invoices WHERE user_id=$1 AND status IN ('unpaid','partial') AND due_date < $2",[uid,today])]);res.json({success:true,stats:{monthly_sales:parseFloat(s.rows[0].t),monthly_purchases:parseFloat(p.rows[0].t),total_outstanding:parseFloat(o.rows[0].t),overdue_amount:parseFloat(ov.rows[0].t)}});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.get("/api/invoices",auth,async(req,res)=>{
+  try{const{type,status,search}=req.query;let q="SELECT * FROM invoices WHERE user_id=$1";const p=[req.user.id];if(type){q+=` AND invoice_type=$${p.length+1}`;p.push(type);}if(status){q+=` AND status=$${p.length+1}`;p.push(status);}if(search){q+=` AND (party_name ILIKE $${p.length+1} OR invoice_no ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}q+=" ORDER BY created_at DESC";const r=await pool.query(q,p);const invs=r.rows;res.json({success:true,count:invs.length,invoices:invs,summary:{total_amount:invs.reduce((a,i)=>a+parseFloat(i.total_amount||0),0),total_outstanding:invs.reduce((a,i)=>a+parseFloat(i.balance_due||0),0)}});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.get("/api/invoices/:id",auth,async(req,res)=>{
+  try{const inv=await pool.query("SELECT * FROM invoices WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);if(!inv.rows[0])return res.status(404).json({success:false,message:"Not found"});const items=await pool.query("SELECT * FROM invoice_items WHERE invoice_id=$1 ORDER BY id",[req.params.id]);const pays=await pool.query("SELECT * FROM payments WHERE invoice_id=$1 ORDER BY payment_date DESC",[req.params.id]);res.json({success:true,invoice:{...inv.rows[0],items:items.rows,payments:pays.rows}});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/invoices",auth,async(req,res)=>{
+  try{
+    const{invoice_type,party_id,party_name,party_gstin,party_address,party_state,invoice_date,due_date,place_of_supply,is_igst,notes,terms,items=[]}=req.body;
+    if(!party_name)return res.status(400).json({success:false,message:"Party name required"});
+    if(!invoice_date)return res.status(400).json({success:false,message:"Invoice date required"});
+    if(items.length===0)return res.status(400).json({success:false,message:"At least one item required"});
+    const invoice_no=await genInvNo(req.user.id,invoice_type||"SALES");
+    let subtotal=0,totalIGST=0,totalCGST=0,totalSGST=0;
+    const processed=items.map(item=>{
+      const qty=parseFloat(item.qty)||0,rate=parseFloat(item.rate)||0,disc=parseFloat(item.discount_pct)||0,gstRate=parseFloat(item.gst_rate)||0;
+      const gross=qty*rate,discAmt=gross*disc/100,taxable=gross-discAmt;
+      const igst=is_igst?taxable*gstRate/100:0,cgst=!is_igst?taxable*(gstRate/2)/100:0,sgst=!is_igst?taxable*(gstRate/2)/100:0;
+      subtotal+=gross;totalIGST+=igst;totalCGST+=cgst;totalSGST+=sgst;
+      return{...item,taxable_value:taxable,igst_amount:igst,cgst_amount:cgst,sgst_amount:sgst,total_amount:taxable+igst+cgst+sgst};
+    });
+    const totalTax=totalIGST+totalCGST+totalSGST,totalAmount=subtotal+totalTax,id=uuid();
+    await pool.query("INSERT INTO invoices (id,user_id,invoice_no,invoice_type,party_id,party_name,party_gstin,party_address,party_state,invoice_date,due_date,place_of_supply,is_igst,subtotal,taxable_amount,igst_amount,cgst_amount,sgst_amount,total_tax,total_amount,paid_amount,balance_due,status,notes,terms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)",
+      [id,req.user.id,invoice_no,invoice_type||"SALES",party_id||null,party_name,party_gstin||null,party_address||null,party_state||null,invoice_date,due_date||null,place_of_supply||null,is_igst||false,subtotal,subtotal,totalIGST,totalCGST,totalSGST,totalTax,totalAmount,0,totalAmount,"unpaid",notes||null,terms||null]);
+    for(const item of processed){
+      await pool.query("INSERT INTO invoice_items (id,invoice_id,product_id,name,hsn_sac,unit,qty,rate,discount_pct,taxable_value,gst_rate,igst_amount,cgst_amount,sgst_amount,total_amount) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+        [uuid(),id,item.product_id||null,item.name,item.hsn_sac||null,item.unit||"PCS",item.qty,item.rate,item.discount_pct||0,item.taxable_value,item.gst_rate||0,item.igst_amount,item.cgst_amount,item.sgst_amount,item.total_amount]);
+      if(item.product_id){
+        const sc=(invoice_type==="SALES")?-parseFloat(item.qty):parseFloat(item.qty);
+        const pr=await pool.query("SELECT stock_qty FROM products WHERE id=$1",[item.product_id]);
+        if(pr.rows[0]){const ns=Math.max(0,parseFloat(pr.rows[0].stock_qty)+sc);await pool.query("UPDATE products SET stock_qty=$1,updated_at=NOW() WHERE id=$2",[ns,item.product_id]);await pool.query("INSERT INTO stock_movements (id,user_id,product_id,type,qty,rate,reference,invoice_id,notes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",[uuid(),req.user.id,item.product_id,invoice_type==="SALES"?"OUT":"IN",Math.abs(parseFloat(item.qty)),item.rate,invoice_no,id,`${invoice_type} Invoice`]);}
       }
     }
-
-    const inv = db.prepare("SELECT * FROM invoices WHERE id=?").get(id);
-    const invItems = db.prepare("SELECT * FROM invoice_items WHERE invoice_id=?").all(id);
-    res.status(201).json({ success:true, message:"Invoice created", invoice:{ ...inv, items:invItems } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+    const inv=await pool.query("SELECT * FROM invoices WHERE id=$1",[id]);
+    const invItems=await pool.query("SELECT * FROM invoice_items WHERE invoice_id=$1",[id]);
+    res.status(201).json({success:true,message:"Invoice created",invoice:{...inv.rows[0],items:invItems.rows}});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/invoices/:id/payment",auth,async(req,res)=>{
+  try{const{amount,method,reference_no,payment_date}=req.body;const inv=await pool.query("SELECT * FROM invoices WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);if(!inv.rows[0])return res.status(404).json({success:false,message:"Not found"});const paidAmt=parseFloat(inv.rows[0].paid_amount)+parseFloat(amount),balance=Math.max(0,parseFloat(inv.rows[0].total_amount)-paidAmt),status=balance<=0?"paid":"partial";await pool.query("UPDATE invoices SET paid_amount=$1,balance_due=$2,status=$3,updated_at=NOW() WHERE id=$4",[paidAmt,balance,status,req.params.id]);await pool.query("INSERT INTO payments (id,user_id,invoice_id,party_name,type,amount,method,reference_no,payment_date) VALUES ($1,$2,$3,$4,'RECEIVED',$5,$6,$7,$8)",[uuid(),req.user.id,req.params.id,inv.rows[0].party_name,parseFloat(amount),method||"CASH",reference_no||null,payment_date]);res.json({success:true,message:"Payment recorded",paid_amount:paidAmt,balance_due:balance});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.delete("/api/invoices/:id",auth,async(req,res)=>{
+  try{await pool.query("DELETE FROM invoice_items WHERE invoice_id=$1",[req.params.id]);await pool.query("DELETE FROM invoices WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);res.json({success:true,message:"Deleted"});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.post("/api/invoices/:id/payment", auth, (req, res) => {
-  try {
-    const { amount, method, reference_no, payment_date } = req.body;
-    const inv = db.prepare("SELECT * FROM invoices WHERE id=? AND user_id=?").get(req.params.id,req.user.id);
-    if (!inv) return res.status(404).json({ success:false, message:"Not found" });
-    const paidAmt = parseFloat(inv.paid_amount)+parseFloat(amount);
-    const balance = Math.max(0, parseFloat(inv.total_amount)-paidAmt);
-    const status  = balance<=0 ? "paid" : "partial";
-    db.prepare("UPDATE invoices SET paid_amount=?,balance_due=?,status=?,updated_at=datetime('now') WHERE id=?").run(paidAmt,balance,status,req.params.id);
-    db.prepare("INSERT INTO payments (id,user_id,invoice_id,party_name,type,amount,method,reference_no,payment_date) VALUES (?,?,?,?,'RECEIVED',?,?,?,?)").run(uuid(),req.user.id,req.params.id,inv.party_name,parseFloat(amount),method||"CASH",reference_no||null,payment_date);
-    res.json({ success:true, message:"Payment recorded", paid_amount:paidAmt, balance_due:balance });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+// ══ PARTIES ══
+app.get("/api/parties",auth,async(req,res)=>{
+  try{const{search}=req.query;let q="SELECT c.*,COALESCE((SELECT SUM(balance_due) FROM invoices WHERE party_id=c.id AND status IN ('unpaid','partial')),0) as outstanding FROM clients c WHERE c.user_id=$1";const p=[req.user.id];if(search){q+=` AND (c.name ILIKE $${p.length+1} OR c.gstin ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}q+=" ORDER BY c.name ASC";const r=await pool.query(q,p);res.json({success:true,parties:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/parties",auth,async(req,res)=>{
+  try{const{name,gstin,state,type,phone,email,address,city,pincode,pan,credit_limit}=req.body;if(!name)return res.status(400).json({success:false,message:"Name required"});const id=uuid();await pool.query("INSERT INTO clients (id,user_id,name,gstin,state,type,phone,email,address,city,pincode,pan,credit_limit) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",[id,req.user.id,name,gstin||null,state||null,type||"Customer",phone||null,email||null,address||null,city||null,pincode||null,pan||null,parseFloat(credit_limit)||0]);const r=await pool.query("SELECT * FROM clients WHERE id=$1",[id]);res.status(201).json({success:true,message:"Party added",party:r.rows[0]});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.put("/api/parties/:id",auth,async(req,res)=>{
+  try{const{name,gstin,state,type,phone,email,address,city,pincode,pan,credit_limit}=req.body;await pool.query("UPDATE clients SET name=$1,gstin=$2,state=$3,type=$4,phone=$5,email=$6,address=$7,city=$8,pincode=$9,pan=$10,credit_limit=$11,updated_at=NOW() WHERE id=$12 AND user_id=$13",[name,gstin||null,state||null,type||"Customer",phone||null,email||null,address||null,city||null,pincode||null,pan||null,parseFloat(credit_limit)||0,req.params.id,req.user.id]);res.json({success:true,message:"Updated"});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.get("/api/parties/:id/ledger",auth,async(req,res)=>{
+  try{const party=await pool.query("SELECT * FROM clients WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);if(!party.rows[0])return res.status(404).json({success:false,message:"Not found"});const invoices=await pool.query("SELECT * FROM invoices WHERE party_id=$1 AND user_id=$2 ORDER BY invoice_date DESC",[req.params.id,req.user.id]);const payments=await pool.query("SELECT * FROM payments WHERE party_id=$1 AND user_id=$2 ORDER BY payment_date DESC",[req.params.id,req.user.id]);const invs=invoices.rows;const outstanding=invs.reduce((a,i)=>a+parseFloat(i.balance_due||0),0);res.json({success:true,party:party.rows[0],invoices:invs,payments:payments.rows,summary:{total_sales:invs.filter(i=>i.invoice_type==="SALES").reduce((a,i)=>a+parseFloat(i.total_amount||0),0),total_purchases:invs.filter(i=>i.invoice_type==="PURCHASE").reduce((a,i)=>a+parseFloat(i.total_amount||0),0),outstanding}});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.delete("/api/parties/:id",auth,async(req,res)=>{
+  try{await pool.query("DELETE FROM clients WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);res.json({success:true,message:"Deleted"});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.delete("/api/invoices/:id", auth, (req, res) => {
-  try {
-    db.prepare("DELETE FROM invoice_items WHERE invoice_id=?").run(req.params.id);
-    db.prepare("DELETE FROM invoices WHERE id=? AND user_id=?").run(req.params.id,req.user.id);
-    res.json({ success:true, message:"Deleted" });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+// ══ REPORTS ══
+app.get("/api/reports/sales-register",auth,async(req,res)=>{
+  try{const{from_date,to_date}=req.query;let q="SELECT * FROM invoices WHERE user_id=$1 AND invoice_type='SALES'";const p=[req.user.id];if(from_date){q+=` AND invoice_date>=$${p.length+1}`;p.push(from_date);}if(to_date){q+=` AND invoice_date<=$${p.length+1}`;p.push(to_date);}q+=" ORDER BY invoice_date ASC";const r=await pool.query(q,p);const invs=r.rows;res.json({success:true,invoices:invs,summary:{total_invoices:invs.length,total_taxable:invs.reduce((a,i)=>a+parseFloat(i.taxable_amount||0),0),total_igst:invs.reduce((a,i)=>a+parseFloat(i.igst_amount||0),0),total_cgst:invs.reduce((a,i)=>a+parseFloat(i.cgst_amount||0),0),total_sgst:invs.reduce((a,i)=>a+parseFloat(i.sgst_amount||0),0),total_amount:invs.reduce((a,i)=>a+parseFloat(i.total_amount||0),0)}});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.get("/api/reports/purchase-register",auth,async(req,res)=>{
+  try{const{from_date,to_date}=req.query;let q="SELECT * FROM invoices WHERE user_id=$1 AND invoice_type='PURCHASE'";const p=[req.user.id];if(from_date){q+=` AND invoice_date>=$${p.length+1}`;p.push(from_date);}if(to_date){q+=` AND invoice_date<=$${p.length+1}`;p.push(to_date);}q+=" ORDER BY invoice_date ASC";const r=await pool.query(q,p);const invs=r.rows;res.json({success:true,invoices:invs,summary:{total_invoices:invs.length,total_taxable:invs.reduce((a,i)=>a+parseFloat(i.taxable_amount||0),0),total_amount:invs.reduce((a,i)=>a+parseFloat(i.total_amount||0),0)}});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.get("/api/reports/gst-summary",auth,async(req,res)=>{
+  try{const{from_date,to_date}=req.query;const uid=req.user.id;let where="";const p=[uid];if(from_date){where+=` AND invoice_date>=$${p.length+1}`;p.push(from_date);}if(to_date){where+=` AND invoice_date<=$${p.length+1}`;p.push(to_date);}const s=await pool.query(`SELECT COALESCE(SUM(taxable_amount),0) as taxable,COALESCE(SUM(igst_amount),0) as igst,COALESCE(SUM(cgst_amount),0) as cgst,COALESCE(SUM(sgst_amount),0) as sgst,COALESCE(SUM(total_amount),0) as total FROM invoices WHERE user_id=$1 AND invoice_type='SALES'${where}`,p);const pr=await pool.query(`SELECT COALESCE(SUM(taxable_amount),0) as taxable,COALESCE(SUM(igst_amount),0) as igst,COALESCE(SUM(cgst_amount),0) as cgst,COALESCE(SUM(sgst_amount),0) as sgst,COALESCE(SUM(total_amount),0) as total FROM invoices WHERE user_id=$1 AND invoice_type='PURCHASE'${where}`,p);const sales=s.rows[0],purchase=pr.rows[0];const outputTax=parseFloat(sales.igst||0)+parseFloat(sales.cgst||0)+parseFloat(sales.sgst||0),inputTax=parseFloat(purchase.igst||0)+parseFloat(purchase.cgst||0)+parseFloat(purchase.sgst||0);res.json({success:true,report:{sales:{taxable:parseFloat(sales.taxable),igst:parseFloat(sales.igst),cgst:parseFloat(sales.cgst),sgst:parseFloat(sales.sgst),total:parseFloat(sales.total)},purchase:{taxable:parseFloat(purchase.taxable),igst:parseFloat(purchase.igst),cgst:parseFloat(purchase.cgst),sgst:parseFloat(purchase.sgst),total:parseFloat(purchase.total)},output_tax:outputTax,input_tax:inputTax,net_gst_payable:outputTax-inputTax}});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.get("/api/reports/outstanding",auth,async(req,res)=>{
+  try{const r=await pool.query("SELECT party_name,party_gstin,COUNT(*) as invoice_count,SUM(total_amount) as total_billed,SUM(paid_amount) as total_paid,SUM(balance_due) as outstanding,MIN(due_date) as oldest_due FROM invoices WHERE user_id=$1 AND status IN ('unpaid','partial') AND invoice_type='SALES' GROUP BY party_name,party_gstin ORDER BY outstanding DESC",[req.user.id]);res.json({success:true,parties:r.rows,total_outstanding:r.rows.reduce((a,r)=>a+parseFloat(r.outstanding||0),0)});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.get("/api/reports/profit-loss",auth,async(req,res)=>{
+  try{const{from_date,to_date}=req.query;const uid=req.user.id;let where="";const p=[uid];if(from_date){where+=` AND invoice_date>=$${p.length+1}`;p.push(from_date);}if(to_date){where+=` AND invoice_date<=$${p.length+1}`;p.push(to_date);}const s=await pool.query(`SELECT COALESCE(SUM(taxable_amount),0) as total FROM invoices WHERE user_id=$1 AND invoice_type='SALES'${where}`,p);const pr=await pool.query(`SELECT COALESCE(SUM(taxable_amount),0) as total FROM invoices WHERE user_id=$1 AND invoice_type='PURCHASE'${where}`,p);const sl=parseFloat(s.rows[0].total),pu=parseFloat(pr.rows[0].total),gross=sl-pu;res.json({success:true,pl:{income:{sales:sl,total:sl},expenses:{purchases:pu,total:pu},gross_profit:gross,net_profit:gross}});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.get("/api/reports/day-book",auth,async(req,res)=>{
+  try{const date=req.query.date||new Date().toISOString().split("T")[0];const invoices=await pool.query("SELECT * FROM invoices WHERE user_id=$1 AND invoice_date=$2 ORDER BY created_at ASC",[req.user.id,date]);const payments=await pool.query("SELECT * FROM payments WHERE user_id=$1 AND payment_date=$2 ORDER BY created_at ASC",[req.user.id,date]);const invs=invoices.rows,pays=payments.rows;res.json({success:true,date,invoices:invs,payments:pays,summary:{total_sales:invs.filter(i=>i.invoice_type==="SALES").reduce((a,i)=>a+parseFloat(i.total_amount||0),0),total_purchases:invs.filter(i=>i.invoice_type==="PURCHASE").reduce((a,i)=>a+parseFloat(i.total_amount||0),0),total_received:pays.filter(p=>p.type==="RECEIVED").reduce((a,p)=>a+parseFloat(p.amount||0),0),total_paid:pays.filter(p=>p.type==="PAID").reduce((a,p)=>a+parseFloat(p.amount||0),0)}});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-// ══════════════════════════════════════════════════════════════════════════
-// ── PARTIES ───────────────────────────────────────────────────────────────
-// ══════════════════════════════════════════════════════════════════════════
-app.get("/api/parties", auth, (req, res) => {
-  try {
-    const { search } = req.query;
-    let q = "SELECT c.*, COALESCE((SELECT SUM(balance_due) FROM invoices WHERE party_id=c.id AND status IN ('unpaid','partial')),0) as outstanding FROM clients c WHERE c.user_id=?";
-    const params = [req.user.id];
-    if (search) { q+=" AND (c.name LIKE ? OR c.gstin LIKE ?)"; params.push(`%${search}%`,`%${search}%`); }
-    q+=" ORDER BY c.name ASC";
-    res.json({ success:true, parties:db.prepare(q).all(...params) });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+// ══ BANK STATEMENT ══
+const guessCategory=d=>{const t=(d||"").toLowerCase();if(t.includes("salary")||t.includes("payroll"))return"Salary";if(t.includes("rent"))return"Rent";if(t.includes("gst")||t.includes("tds"))return"Tax Payment";if(t.includes("electricity")||t.includes("utility"))return"Utilities";if(t.includes("neft")||t.includes("rtgs")||t.includes("imps"))return"Fund Transfer";if(t.includes("atm")||t.includes("cash"))return"Cash";if(t.includes("emi")||t.includes("loan"))return"Loan Payment";if(t.includes("interest"))return"Interest";if(t.includes("charges")||t.includes("fee"))return"Bank Charges";if(t.includes("insurance")||t.includes("premium"))return"Insurance";if(t.includes("purchase")||t.includes("vendor"))return"Purchase";if(t.includes("sale")||t.includes("receipt"))return"Sales Receipt";if(t.includes("amazon")||t.includes("flipkart"))return"Online Purchase";if(t.includes("petrol")||t.includes("fuel"))return"Fuel";if(t.includes("medical")||t.includes("hospital"))return"Medical";return"Uncategorized";};
+const guessType=(d,isDebit)=>{const t=(d||"").toLowerCase();if(t.includes("gst")||t.includes("tds")||t.includes("tax"))return"TAX";if(t.includes("neft")||t.includes("rtgs")||t.includes("imps")||t.includes("transfer"))return"TRANSFER";if(t.includes("emi")||t.includes("loan")||t.includes("charges")||t.includes("fee"))return"BANK";if(!isDebit)return"INCOME";if(t.includes("salary")||t.includes("rent")||t.includes("vendor"))return"EXPENSE";if(t.includes("purchase")||t.includes("supplier"))return"PURCHASE";return isDebit?"EXPENSE":"INCOME";};
+const parseTransactions=text=>{const lines=text.split("\n").map(l=>l.trim()).filter(l=>l.length>5);const txns=[];const dReg=/(\d{2}[\/\-]\d{2}[\/\-]\d{4}|\d{2}[\/\-]\d{2}[\/\-]\d{2})/;for(const line of lines){const dm=line.match(dReg);if(!dm)continue;const ds=dm[1];const ars=[];let m;const ar=/(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)/g;while((m=ar.exec(line))!==null){const v=parseFloat(m[1].replace(/,/g,""));if(v>0)ars.push(v);}if(ars.length<2)continue;let desc=line.replace(ds,"").replace(/\d{1,3}(?:,\d{3})*(?:\.\d{2})?/g,"").replace(/\s+/g," ").trim();if(!desc||desc.length<3)continue;const isDebit=line.toLowerCase().includes("dr")||line.toLowerCase().includes("debit");const debit=isDebit?ars[ars.length-3]||ars[0]||0:0;const credit=!isDebit?ars[ars.length-2]||ars[0]||0:0;const normDate=ds.replace(/(\d{2})[\/\-](\d{2})[\/\-](\d{2,4})/,(_,d,mo,y)=>`${y.length===2?"20"+y:y}-${mo}-${d}`);txns.push({txn_date:normDate,description:desc.substring(0,200),debit,credit,balance:ars[ars.length-1]||0,category:guessCategory(desc),type:guessType(desc,isDebit)});}return txns;};
+
+app.post("/api/bank/upload",upload.single("file"),auth,async(req,res)=>{
+  try{if(!req.file)return res.status(400).json({success:false,message:"PDF required"});let text="";try{const pp=require("pdf-parse");const data=await pp(req.file.buffer);text=data.text;}catch(e){return res.status(400).json({success:false,message:"Cannot read PDF. Use digital (not scanned) PDF."});}if(!text||text.length<50)return res.status(400).json({success:false,message:"No text found in PDF."});const transactions=parseTransactions(text);if(transactions.length===0)return res.status(400).json({success:false,message:"No transactions found."});const td=transactions.reduce((a,t)=>a+(t.debit||0),0),tc=transactions.reduce((a,t)=>a+(t.credit||0),0);res.json({success:true,message:`Found ${transactions.length} transactions`,preview:{bank_name:req.body.bank_name||"Unknown Bank",account_no:req.body.account_no||"",total_txns:transactions.length,total_debit:td,total_credit:tc,transactions}});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/bank/import",auth,async(req,res)=>{
+  try{const{bank_name,account_no,transactions}=req.body;if(!transactions||transactions.length===0)return res.status(400).json({success:false,message:"No transactions"});const importId=uuid();const td=transactions.reduce((a,t)=>a+(t.debit||0),0),tc=transactions.reduce((a,t)=>a+(t.credit||0),0);await pool.query("INSERT INTO bank_imports (id,user_id,bank_name,account_no,total_txns,total_debit,total_credit,filename) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",[importId,req.user.id,bank_name||"Unknown",account_no||"",transactions.length,td,tc,`statement_${Date.now()}.pdf`]);for(const t of transactions){await pool.query("INSERT INTO bank_transactions (id,user_id,bank_name,account_no,txn_date,description,debit,credit,balance,category,type,import_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",[uuid(),req.user.id,bank_name||"Unknown",account_no||"",t.txn_date,t.description,t.debit||0,t.credit||0,t.balance||0,t.category||"Uncategorized",t.type||"UNKNOWN",importId]);}res.json({success:true,message:`${transactions.length} transactions imported!`,import_id:importId});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.get("/api/bank/transactions",auth,async(req,res)=>{
+  try{const{type,from_date,to_date}=req.query;let q="SELECT * FROM bank_transactions WHERE user_id=$1";const p=[req.user.id];if(type&&type!=="all"){q+=` AND type=$${p.length+1}`;p.push(type);}if(from_date){q+=` AND txn_date>=$${p.length+1}`;p.push(from_date);}if(to_date){q+=` AND txn_date<=$${p.length+1}`;p.push(to_date);}q+=" ORDER BY txn_date DESC, created_at DESC";const r=await pool.query(q,p);const rows=r.rows;res.json({success:true,count:rows.length,transactions:rows,summary:{total_debit:rows.reduce((a,t)=>a+parseFloat(t.debit||0),0),total_credit:rows.reduce((a,t)=>a+parseFloat(t.credit||0),0)}});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.get("/api/bank/imports",auth,async(req,res)=>{
+  try{const r=await pool.query("SELECT * FROM bank_imports WHERE user_id=$1 ORDER BY created_at DESC",[req.user.id]);res.json({success:true,imports:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.patch("/api/bank/transactions/:id",auth,async(req,res)=>{
+  try{const{category,type,notes}=req.body;await pool.query("UPDATE bank_transactions SET category=$1,type=$2,notes=$3 WHERE id=$4 AND user_id=$5",[category,type,notes||null,req.params.id,req.user.id]);res.json({success:true,message:"Updated"});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.post("/api/parties", auth, (req, res) => {
-  try {
-    const { name, gstin, state, type, phone, email, address, city, pincode, pan, credit_limit } = req.body;
-    if (!name) return res.status(400).json({ success:false, message:"Name required" });
-    const id = uuid();
-    db.prepare("INSERT INTO clients (id,user_id,name,gstin,state,type,phone,email,address,city,pincode,pan,credit_limit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id,req.user.id,name,gstin||null,state||null,type||"Customer",phone||null,email||null,address||null,city||null,pincode||null,pan||null,parseFloat(credit_limit)||0);
-    res.status(201).json({ success:true, message:"Party added", party:db.prepare("SELECT * FROM clients WHERE id=?").get(id) });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+// ══ AI ══
+app.post("/api/ai/chat",auth,async(req,res)=>{
+  try{const reply=await callGroq(req.body.messages||[],"You are an expert Indian GST consultant and accounting professional. Help with GST, ITC, vouchers, ledgers, balance sheet, P&L, trial balance, and all accounting topics. Be concise. Use Rs. for currency.");res.json({success:true,reply});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/ai/generate-reply",auth,async(req,res)=>{
+  try{const{client_name,gstin,notice_type,ref_no,amount,description}=req.body;const prompt=`GST Notice Reply:\nClient: ${client_name}\nGSTIN: ${gstin}\nNotice: ${notice_type}\nRef: ${ref_no}\nAmount: Rs.${amount}\nDetails: ${description||"Not provided"}\n\nWrite formal reply citing CGST Act sections.`;const reply=await callGroq([{role:"user",content:prompt}],"You are a GST lawyer. Write formal, professional notice replies.");res.json({success:true,reply});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.put("/api/parties/:id", auth, (req, res) => {
-  try {
-    const { name, gstin, state, type, phone, email, address, city, pincode, pan, credit_limit } = req.body;
-    db.prepare("UPDATE clients SET name=?,gstin=?,state=?,type=?,phone=?,email=?,address=?,city=?,pincode=?,pan=?,credit_limit=?,updated_at=datetime('now') WHERE id=? AND user_id=?").run(name,gstin||null,state||null,type||"Customer",phone||null,email||null,address||null,city||null,pincode||null,pan||null,parseFloat(credit_limit)||0,req.params.id,req.user.id);
-    res.json({ success:true, message:"Updated" });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+// ══ CHALLANS ══
+app.get("/api/challans",auth,async(req,res)=>{try{const r=await pool.query("SELECT ch.*,c.name as client_name,c.gstin FROM challans ch JOIN clients c ON ch.client_id=c.id WHERE ch.user_id=$1 ORDER BY ch.created_at DESC",[req.user.id]);res.json({success:true,challans:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}});
+app.post("/api/challans",auth,async(req,res)=>{try{const{client_id,challan_no,type,amount,period,payment_date,notes}=req.body;const id=uuid();await pool.query("INSERT INTO challans (id,user_id,client_id,challan_no,type,amount,period,payment_date,notes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",[id,req.user.id,client_id,challan_no,type,parseFloat(amount)||0,period||null,payment_date,notes||null]);res.status(201).json({success:true,message:"Challan added"});}catch(e){res.status(500).json({success:false,message:e.message});}});
+app.delete("/api/challans/:id",auth,async(req,res)=>{try{await pool.query("DELETE FROM challans WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);res.json({success:true,message:"Deleted"});}catch(e){res.status(500).json({success:false,message:e.message});}});
+
+// ══ IMPORT EXCEL ══
+app.post("/api/import/clients",upload.single("file"),auth,async(req,res)=>{
+  try{const wb=XLSX.read(req.file.buffer,{type:"buffer"});const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);let imported=0,skipped=0;for(const row of rows){const gstin=(row["GSTIN"]||row["gstin"]||"").toString().trim().toUpperCase();const name=(row["Name"]||row["name"]||row["Trade Name"]||"").toString().trim();if(!gstin||!name){skipped++;continue;}const ex=await pool.query("SELECT id FROM clients WHERE user_id=$1 AND gstin=$2",[req.user.id,gstin]);if(ex.rows[0]){skipped++;continue;}await pool.query("INSERT INTO clients (id,user_id,name,gstin,state,type,status) VALUES ($1,$2,$3,$4,$5,$6,'compliant')",[uuid(),req.user.id,name,gstin,(row["State"]||row["state"]||"").toString().trim(),(row["Type"]||row["type"]||"Trader").toString().trim()]);imported++;}res.json({success:true,message:`${imported} imported, ${skipped} skipped`});}catch(e){res.status(500).json({success:false,message:"Import failed: "+e.message});}
 });
 
-app.get("/api/parties/:id/ledger", auth, (req, res) => {
-  try {
-    const party    = db.prepare("SELECT * FROM clients WHERE id=? AND user_id=?").get(req.params.id,req.user.id);
-    if (!party) return res.status(404).json({ success:false, message:"Not found" });
-    const invoices = db.prepare("SELECT * FROM invoices WHERE party_id=? AND user_id=? ORDER BY invoice_date DESC").all(req.params.id,req.user.id);
-    const payments = db.prepare("SELECT * FROM payments WHERE party_id=? AND user_id=? ORDER BY payment_date DESC").all(req.params.id,req.user.id);
-    const outstanding = invoices.reduce((a,i)=>a+(i.balance_due||0),0);
-    res.json({ success:true, party, invoices, payments, summary:{ total_sales:invoices.filter(i=>i.invoice_type==="SALES").reduce((a,i)=>a+(i.total_amount||0),0), total_purchases:invoices.filter(i=>i.invoice_type==="PURCHASE").reduce((a,i)=>a+(i.total_amount||0),0), outstanding } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+// ══ GSTR-2A ══
+app.post("/api/gstr2a/preview",upload.single("file"),auth,async(req,res)=>{
+  try{const wb=XLSX.read(req.file.buffer,{type:"buffer"});const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:""});const grouped={};for(const row of rows){const gstin=(row["GSTIN of Supplier"]||row["GSTIN"]||row["gstin"]||row["ctin"]||"").toString().trim().toUpperCase();if(!gstin||gstin.length<15)continue;const name=(row["Trade/Legal name of the Supplier"]||row["Trade Name"]||row["trdnm"]||"").toString().trim();const itc=(parseFloat(row["Integrated Tax Amount"]||row["iamt"]||0)||0)+(parseFloat(row["Central Tax Amount"]||row["camt"]||0)||0)+(parseFloat(row["State/UT Tax Amount"]||row["samt"]||0)||0);if(!grouped[gstin])grouped[gstin]={gstin,name,invoices:0,igst:parseFloat(row["Integrated Tax Amount"]||0)||0,cgst:parseFloat(row["Central Tax Amount"]||0)||0,sgst:parseFloat(row["State/UT Tax Amount"]||0)||0,itc:0};grouped[gstin].invoices++;grouped[gstin].itc+=itc;}const suppliers=Object.values(grouped);res.json({success:true,preview:{total_invoices:rows.length,total_suppliers:suppliers.length,total_itc:suppliers.reduce((a,s)=>a+s.itc,0),suppliers}});}catch(e){res.status(500).json({success:false,message:"Preview failed: "+e.message});}
+});
+app.post("/api/gstr2a/import",upload.single("file"),auth,async(req,res)=>{
+  try{const{client_id,period}=req.body;const wb=XLSX.read(req.file.buffer,{type:"buffer"});const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:""});const grouped={};for(const row of rows){const gstin=(row["GSTIN of Supplier"]||row["GSTIN"]||row["gstin"]||row["ctin"]||"").toString().trim().toUpperCase();if(!gstin||gstin.length<15)continue;const name=(row["Trade/Legal name of the Supplier"]||row["Trade Name"]||row["trdnm"]||"").toString().trim();const itc=(parseFloat(row["Integrated Tax Amount"]||row["iamt"]||0)||0)+(parseFloat(row["Central Tax Amount"]||row["camt"]||0)||0)+(parseFloat(row["State/UT Tax Amount"]||row["samt"]||0)||0);if(!grouped[gstin])grouped[gstin]={gstin,name,count:0,itc:0};grouped[gstin].count++;grouped[gstin].itc+=itc;}let saved=0;for(const s of Object.values(grouped)){await pool.query("INSERT INTO reconciliation (id,user_id,client_id,period,vendor_name,vendor_gstin,invoice_count,gstr2a_amount,gstr2b_amount,books_amount,difference,status,remarks) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,'mismatch','Imported from GSTR-2A') ON CONFLICT DO NOTHING",[uuid(),req.user.id,client_id,period,s.name,s.gstin,s.count,s.itc,s.itc,s.itc]);saved++;}res.json({success:true,message:`${saved} suppliers imported!`,summary:{total_invoices:rows.length,saved,total_itc:Object.values(grouped).reduce((a,s)=>a+s.itc,0)}});}catch(e){res.status(500).json({success:false,message:"Import failed: "+e.message});}
 });
 
-app.delete("/api/parties/:id", auth, (req, res) => {
-  try {
-    db.prepare("DELETE FROM clients WHERE id=? AND user_id=?").run(req.params.id,req.user.id);
-    res.json({ success:true, message:"Deleted" });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+// ══ GSTIN ══
+const STATES_MAP={"35":"Andaman and Nicobar Islands","37":"Andhra Pradesh","12":"Arunachal Pradesh","18":"Assam","10":"Bihar","04":"Chandigarh","22":"Chhattisgarh","26":"Dadra & Nagar Haveli and Daman & Diu","07":"Delhi","30":"Goa","24":"Gujarat","06":"Haryana","02":"Himachal Pradesh","01":"Jammu & Kashmir","20":"Jharkhand","29":"Karnataka","32":"Kerala","38":"Ladakh","31":"Lakshadweep","23":"Madhya Pradesh","27":"Maharashtra","14":"Manipur","17":"Meghalaya","15":"Mizoram","13":"Nagaland","21":"Odisha","34":"Puducherry","03":"Punjab","08":"Rajasthan","11":"Sikkim","33":"Tamil Nadu","36":"Telangana","16":"Tripura","09":"Uttar Pradesh","05":"Uttarakhand","19":"West Bengal"};
+app.get("/api/gstin/validate/:gstin",auth,(req,res)=>{const g=req.params.gstin.toUpperCase().trim();const valid=/^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/.test(g);if(!valid)return res.json({success:true,valid:false,message:"Invalid GSTIN format"});res.json({success:true,valid:true,message:"Valid format",details:{gstin:g,state_code:g.substring(0,2),state:STATES_MAP[g.substring(0,2)]||"Unknown",pan:g.substring(2,12)}});});
+
+// ══ STAFF ══
+app.get("/api/staff",auth,async(req,res)=>{try{const r=await pool.query("SELECT id,name,email,role,firm_name,created_at FROM users WHERE parent_id=$1 ORDER BY created_at DESC",[req.user.id]);res.json({success:true,staff:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}});
+app.post("/api/staff",auth,async(req,res)=>{try{const{name,email,password}=req.body;if(!name||!email||!password)return res.status(400).json({success:false,message:"All fields required"});const ex=await pool.query("SELECT id FROM users WHERE email=$1",[email.toLowerCase()]);if(ex.rows[0])return res.status(409).json({success:false,message:"Email exists"});const hashed=await bcrypt.hash(password,12);const id=uuid();await pool.query("INSERT INTO users (id,name,email,password,firm_name,role,parent_id) VALUES ($1,$2,$3,$4,$5,'staff',$6)",[id,name,email.toLowerCase(),hashed,req.user.firm_name,req.user.id]);res.status(201).json({success:true,message:"Staff added",staff:{id,name,email,role:"staff"}});}catch(e){res.status(500).json({success:false,message:e.message});}});
+app.delete("/api/staff/:id",auth,async(req,res)=>{try{await pool.query("DELETE FROM users WHERE id=$1 AND parent_id=$2",[req.params.id,req.user.id]);res.json({success:true,message:"Staff removed"});}catch(e){res.status(500).json({success:false,message:e.message});}});
+// ══ ACCOUNTING: COMPANIES ══
+app.get("/api/accounting/companies",auth,async(req,res)=>{try{const r=await pool.query("SELECT * FROM companies WHERE user_id=$1 ORDER BY name ASC",[req.user.id]);res.json({success:true,companies:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}});
+app.post("/api/accounting/companies",auth,async(req,res)=>{
+  try{
+    const{name,legal_name,gstin,pan,address,city,state,pincode,phone,email,fy_start,fy_end,financial_year}=req.body;
+    if(!name)return res.status(400).json({success:false,message:"Company name required"});
+    const id=uuid();
+    await pool.query("INSERT INTO companies (id,user_id,name,legal_name,gstin,pan,address,city,state,pincode,phone,email,fy_start,fy_end,financial_year) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+      [id,req.user.id,name,legal_name||null,gstin||null,pan||null,address||null,city||null,state||null,pincode||null,phone||null,email||null,fy_start||"2024-04-01",fy_end||"2025-03-31",financial_year||"Apr-Mar"]);
+    await createDefaultAccounting(id,req.user.id);
+    const r=await pool.query("SELECT * FROM companies WHERE id=$1",[id]);
+    res.status(201).json({success:true,message:"Company created with Chart of Accounts!",company:r.rows[0]});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.put("/api/accounting/companies/:id",auth,async(req,res)=>{
+  try{const{name,legal_name,gstin,pan,address,city,state,pincode,phone,email,fy_start,fy_end}=req.body;await pool.query("UPDATE companies SET name=$1,legal_name=$2,gstin=$3,pan=$4,address=$5,city=$6,state=$7,pincode=$8,phone=$9,email=$10,fy_start=$11,fy_end=$12 WHERE id=$13 AND user_id=$14",[name,legal_name||null,gstin||null,pan||null,address||null,city||null,state||null,pincode||null,phone||null,email||null,fy_start||"2024-04-01",fy_end||"2025-03-31",req.params.id,req.user.id]);res.json({success:true,message:"Updated"});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.delete("/api/accounting/companies/:id",auth,async(req,res)=>{try{await pool.query("DELETE FROM companies WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);res.json({success:true,message:"Deleted"});}catch(e){res.status(500).json({success:false,message:e.message});}});
+
+// ══ ACCOUNTING: LEDGER GROUPS ══
+app.get("/api/accounting/companies/:cid/groups",auth,async(req,res)=>{try{const r=await pool.query("SELECT * FROM ledger_groups WHERE company_id=$1 AND user_id=$2 ORDER BY nature ASC,name ASC",[req.params.cid,req.user.id]);res.json({success:true,groups:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}});
+app.post("/api/accounting/companies/:cid/groups",auth,async(req,res)=>{try{const{name,parent_id,nature,affects_gross}=req.body;if(!name||!nature)return res.status(400).json({success:false,message:"Name and nature required"});const id=uuid();await pool.query("INSERT INTO ledger_groups (id,user_id,company_id,name,parent_id,nature,affects_gross) VALUES ($1,$2,$3,$4,$5,$6,$7)",[id,req.user.id,req.params.cid,name,parent_id||null,nature,affects_gross||false]);const r=await pool.query("SELECT * FROM ledger_groups WHERE id=$1",[id]);res.status(201).json({success:true,message:"Group created",group:r.rows[0]});}catch(e){res.status(500).json({success:false,message:e.message});}});
+app.put("/api/accounting/companies/:cid/groups/:id",auth,async(req,res)=>{try{const{name,parent_id,nature,affects_gross}=req.body;await pool.query("UPDATE ledger_groups SET name=$1,parent_id=$2,nature=$3,affects_gross=$4 WHERE id=$5 AND user_id=$6",[name,parent_id||null,nature,affects_gross||false,req.params.id,req.user.id]);res.json({success:true,message:"Updated"});}catch(e){res.status(500).json({success:false,message:e.message});}});
+app.delete("/api/accounting/companies/:cid/groups/:id",auth,async(req,res)=>{try{const h=await pool.query("SELECT COUNT(*) as c FROM ledgers WHERE group_id=$1",[req.params.id]);if(parseInt(h.rows[0].c)>0)return res.status(400).json({success:false,message:"Cannot delete group with ledgers"});await pool.query("DELETE FROM ledger_groups WHERE id=$1 AND user_id=$2 AND is_default=FALSE",[req.params.id,req.user.id]);res.json({success:true,message:"Deleted"});}catch(e){res.status(500).json({success:false,message:e.message});}});
+
+// ══ ACCOUNTING: LEDGERS ══
+app.get("/api/accounting/companies/:cid/ledgers",auth,async(req,res)=>{
+  try{
+    const{group_id,nature,search}=req.query;
+    let q="SELECT l.*,g.name as group_name,g.nature FROM ledgers l JOIN ledger_groups g ON l.group_id=g.id WHERE l.company_id=$1 AND l.user_id=$2";
+    const p=[req.params.cid,req.user.id];
+    if(group_id){q+=` AND l.group_id=$${p.length+1}`;p.push(group_id);}
+    if(nature){q+=` AND g.nature=$${p.length+1}`;p.push(nature);}
+    if(search){q+=` AND l.name ILIKE $${p.length+1}`;p.push(`%${search}%`);}
+    q+=" ORDER BY g.nature ASC,l.name ASC";
+    const r=await pool.query(q,p);
+    const withBalance=await Promise.all(r.rows.map(async l=>{
+      const txn=await pool.query("SELECT COALESCE(SUM(dr_amount),0) as dr,COALESCE(SUM(cr_amount),0) as cr FROM voucher_items vi JOIN vouchers v ON vi.voucher_id=v.id WHERE vi.ledger_id=$1 AND v.is_cancelled=FALSE",[l.id]);
+      const opDr=l.opening_type==="Dr"?parseFloat(l.opening_balance):0,opCr=l.opening_type==="Cr"?parseFloat(l.opening_balance):0;
+      const tDr=opDr+parseFloat(txn.rows[0].dr||0),tCr=opCr+parseFloat(txn.rows[0].cr||0);
+      const bal=Math.abs(tDr-tCr),bt=tDr>=tCr?"Dr":"Cr";
+      return{...l,total_dr:tDr,total_cr:tCr,balance:bal,balance_type:bt};
+    }));
+    res.json({success:true,ledgers:withBalance});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/accounting/companies/:cid/ledgers",auth,async(req,res)=>{
+  try{
+    const{name,group_id,opening_balance,opening_type,alias,gstin,pan,address,phone,email,bank_account,bank_name,ifsc_code,credit_limit,credit_days,notes}=req.body;
+    if(!name||!group_id)return res.status(400).json({success:false,message:"Name and group required"});
+    const ex=await pool.query("SELECT id FROM ledgers WHERE company_id=$1 AND name=$2",[req.params.cid,name]);
+    if(ex.rows[0])return res.status(409).json({success:false,message:"Ledger with this name already exists"});
+    const id=uuid();
+    await pool.query("INSERT INTO ledgers (id,user_id,company_id,group_id,name,alias,opening_balance,opening_type,gstin,pan,address,phone,email,bank_account,bank_name,ifsc_code,credit_limit,credit_days,notes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)",
+      [id,req.user.id,req.params.cid,group_id,name.trim(),alias||null,parseFloat(opening_balance)||0,opening_type||"Dr",gstin||null,pan||null,address||null,phone||null,email||null,bank_account||null,bank_name||null,ifsc_code||null,parseFloat(credit_limit)||0,parseInt(credit_days)||0,notes||null]);
+    const r=await pool.query("SELECT * FROM ledgers WHERE id=$1",[id]);
+    res.status(201).json({success:true,message:"Ledger created",ledger:r.rows[0]});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.put("/api/accounting/companies/:cid/ledgers/:id",auth,async(req,res)=>{
+  try{const{name,group_id,opening_balance,opening_type,alias,gstin,pan,address,phone,email,bank_account,bank_name,ifsc_code,credit_limit,credit_days,notes}=req.body;await pool.query("UPDATE ledgers SET name=$1,group_id=$2,alias=$3,opening_balance=$4,opening_type=$5,gstin=$6,pan=$7,address=$8,phone=$9,email=$10,bank_account=$11,bank_name=$12,ifsc_code=$13,credit_limit=$14,credit_days=$15,notes=$16,updated_at=NOW() WHERE id=$17 AND user_id=$18",[name,group_id,alias||null,parseFloat(opening_balance)||0,opening_type||"Dr",gstin||null,pan||null,address||null,phone||null,email||null,bank_account||null,bank_name||null,ifsc_code||null,parseFloat(credit_limit)||0,parseInt(credit_days)||0,notes||null,req.params.id,req.user.id]);res.json({success:true,message:"Ledger updated"});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.delete("/api/accounting/companies/:cid/ledgers/:id",auth,async(req,res)=>{try{const h=await pool.query("SELECT COUNT(*) as c FROM voucher_items WHERE ledger_id=$1",[req.params.id]);if(parseInt(h.rows[0].c)>0)return res.status(400).json({success:false,message:"Cannot delete ledger with transactions"});await pool.query("DELETE FROM ledgers WHERE id=$1 AND user_id=$2 AND is_default=FALSE",[req.params.id,req.user.id]);res.json({success:true,message:"Deleted"});}catch(e){res.status(500).json({success:false,message:e.message});}});
+app.get("/api/accounting/companies/:cid/ledgers/:id/statement",auth,async(req,res)=>{
+  try{
+    const{from_date,to_date}=req.query;
+    const l=await pool.query("SELECT l.*,g.name as group_name,g.nature FROM ledgers l JOIN ledger_groups g ON l.group_id=g.id WHERE l.id=$1",[req.params.id]);
+    if(!l.rows[0])return res.status(404).json({success:false,message:"Ledger not found"});
+    const ledger=l.rows[0];
+    let q="SELECT vi.*,v.date,v.voucher_no,v.voucher_type,v.narration as v_narration FROM voucher_items vi JOIN vouchers v ON vi.voucher_id=v.id WHERE vi.ledger_id=$1 AND v.is_cancelled=FALSE";
+    const p=[req.params.id];
+    if(from_date){q+=` AND v.date>=$${p.length+1}`;p.push(from_date);}
+    if(to_date){q+=` AND v.date<=$${p.length+1}`;p.push(to_date);}
+    q+=" ORDER BY v.date ASC,v.created_at ASC";
+    const txns=await pool.query(q,p);
+    let rb=ledger.opening_type==="Dr"?parseFloat(ledger.opening_balance):-parseFloat(ledger.opening_balance);
+    const withBal=txns.rows.map(t=>{rb+=parseFloat(t.dr_amount||0)-parseFloat(t.cr_amount||0);return{...t,running_balance:Math.abs(rb),balance_type:rb>=0?"Dr":"Cr"};});
+    const td=txns.rows.reduce((a,t)=>a+parseFloat(t.dr_amount||0),0),tc=txns.rows.reduce((a,t)=>a+parseFloat(t.cr_amount||0),0);
+    res.json({success:true,ledger,transactions:withBal,summary:{opening_balance:ledger.opening_balance,opening_type:ledger.opening_type,total_dr:td,total_cr:tc,closing_balance:Math.abs(rb),closing_type:rb>=0?"Dr":"Cr"}});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-// ══════════════════════════════════════════════════════════════════════════
-// ── REPORTS ───────────────────────────────────────────────────────────────
-// ══════════════════════════════════════════════════════════════════════════
-app.get("/api/reports/sales-register", auth, (req, res) => {
-  try {
-    const { from_date, to_date } = req.query;
-    let q = "SELECT * FROM invoices WHERE user_id=? AND invoice_type='SALES'";
-    const params = [req.user.id];
-    if (from_date) { q+=" AND invoice_date>=?"; params.push(from_date); }
-    if (to_date)   { q+=" AND invoice_date<=?"; params.push(to_date); }
-    q+=" ORDER BY invoice_date ASC";
-    const invoices = db.prepare(q).all(...params);
-    res.json({ success:true, invoices, summary:{ total_invoices:invoices.length, total_taxable:invoices.reduce((a,i)=>a+(i.taxable_amount||0),0), total_igst:invoices.reduce((a,i)=>a+(i.igst_amount||0),0), total_cgst:invoices.reduce((a,i)=>a+(i.cgst_amount||0),0), total_sgst:invoices.reduce((a,i)=>a+(i.sgst_amount||0),0), total_amount:invoices.reduce((a,i)=>a+(i.total_amount||0),0) } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+// ══ ACCOUNTING: VOUCHERS ══
+app.get("/api/accounting/companies/:cid/vouchers",auth,async(req,res)=>{
+  try{const{type,from_date,to_date,search}=req.query;let q="SELECT * FROM vouchers WHERE company_id=$1 AND user_id=$2 AND is_cancelled=FALSE";const p=[req.params.cid,req.user.id];if(type){q+=` AND voucher_type=$${p.length+1}`;p.push(type);}if(from_date){q+=` AND date>=$${p.length+1}`;p.push(from_date);}if(to_date){q+=` AND date<=$${p.length+1}`;p.push(to_date);}if(search){q+=` AND (party_name ILIKE $${p.length+1} OR voucher_no ILIKE $${p.length+2} OR narration ILIKE $${p.length+3})`;p.push(`%${search}%`,`%${search}%`,`%${search}%`);}q+=" ORDER BY date DESC,created_at DESC";const r=await pool.query(q,p);res.json({success:true,count:r.rows.length,vouchers:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
-
-app.get("/api/reports/purchase-register", auth, (req, res) => {
-  try {
-    const { from_date, to_date } = req.query;
-    let q = "SELECT * FROM invoices WHERE user_id=? AND invoice_type='PURCHASE'";
-    const params = [req.user.id];
-    if (from_date) { q+=" AND invoice_date>=?"; params.push(from_date); }
-    if (to_date)   { q+=" AND invoice_date<=?"; params.push(to_date); }
-    q+=" ORDER BY invoice_date ASC";
-    const invoices = db.prepare(q).all(...params);
-    res.json({ success:true, invoices, summary:{ total_invoices:invoices.length, total_taxable:invoices.reduce((a,i)=>a+(i.taxable_amount||0),0), total_amount:invoices.reduce((a,i)=>a+(i.total_amount||0),0) } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+app.get("/api/accounting/companies/:cid/vouchers/:id",auth,async(req,res)=>{
+  try{const v=await pool.query("SELECT * FROM vouchers WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);if(!v.rows[0])return res.status(404).json({success:false,message:"Voucher not found"});const items=await pool.query("SELECT vi.*,l.name as ledger_name,g.name as group_name,g.nature FROM voucher_items vi JOIN ledgers l ON vi.ledger_id=l.id JOIN ledger_groups g ON l.group_id=g.id WHERE vi.voucher_id=$1 ORDER BY vi.sort_order ASC",[req.params.id]);res.json({success:true,voucher:{...v.rows[0],items:items.rows}});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
-
-app.get("/api/reports/gst-summary", auth, (req, res) => {
-  try {
-    const { from_date, to_date } = req.query;
-    const uid = req.user.id;
-    let where = "";
-    const params = [uid];
-    if (from_date) { where+=" AND invoice_date>=?"; params.push(from_date); }
-    if (to_date)   { where+=" AND invoice_date<=?"; params.push(to_date); }
-    const s = db.prepare(`SELECT COALESCE(SUM(taxable_amount),0) as taxable,COALESCE(SUM(igst_amount),0) as igst,COALESCE(SUM(cgst_amount),0) as cgst,COALESCE(SUM(sgst_amount),0) as sgst,COALESCE(SUM(total_amount),0) as total FROM invoices WHERE user_id=? AND invoice_type='SALES'${where}`).get(...params);
-    const p = db.prepare(`SELECT COALESCE(SUM(taxable_amount),0) as taxable,COALESCE(SUM(igst_amount),0) as igst,COALESCE(SUM(cgst_amount),0) as cgst,COALESCE(SUM(sgst_amount),0) as sgst,COALESCE(SUM(total_amount),0) as total FROM invoices WHERE user_id=? AND invoice_type='PURCHASE'${where}`).get(...params);
-    const outputTax = (s.igst||0)+(s.cgst||0)+(s.sgst||0);
-    const inputTax  = (p.igst||0)+(p.cgst||0)+(p.sgst||0);
-    res.json({ success:true, report:{ sales:s, purchase:p, output_tax:outputTax, input_tax:inputTax, net_gst_payable:outputTax-inputTax } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.get("/api/reports/outstanding", auth, (req, res) => {
-  try {
-    const rows = db.prepare("SELECT party_name,party_gstin,COUNT(*) as invoice_count,SUM(total_amount) as total_billed,SUM(paid_amount) as total_paid,SUM(balance_due) as outstanding,MIN(due_date) as oldest_due FROM invoices WHERE user_id=? AND status IN ('unpaid','partial') AND invoice_type='SALES' GROUP BY party_name,party_gstin ORDER BY outstanding DESC").all(req.user.id);
-    res.json({ success:true, parties:rows, total_outstanding:rows.reduce((a,r)=>a+(r.outstanding||0),0) });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.get("/api/reports/profit-loss", auth, (req, res) => {
-  try {
-    const { from_date, to_date } = req.query;
-    const uid = req.user.id;
-    let where = "";
-    const params = [uid];
-    if (from_date) { where+=" AND invoice_date>=?"; params.push(from_date); }
-    if (to_date)   { where+=" AND invoice_date<=?"; params.push(to_date); }
-    const sales    = db.prepare(`SELECT COALESCE(SUM(taxable_amount),0) as total FROM invoices WHERE user_id=? AND invoice_type='SALES'${where}`).get(...params).total;
-    const purchases= db.prepare(`SELECT COALESCE(SUM(taxable_amount),0) as total FROM invoices WHERE user_id=? AND invoice_type='PURCHASE'${where}`).get(...params).total;
-    const gross    = sales - purchases;
-    res.json({ success:true, pl:{ income:{ sales, total:sales }, expenses:{ purchases, total:purchases }, gross_profit:gross, net_profit:gross } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.get("/api/reports/day-book", auth, (req, res) => {
-  try {
-    const date = req.query.date || new Date().toISOString().split("T")[0];
-    const invoices = db.prepare("SELECT * FROM invoices WHERE user_id=? AND invoice_date=? ORDER BY created_at ASC").all(req.user.id,date);
-    const payments = db.prepare("SELECT * FROM payments WHERE user_id=? AND payment_date=? ORDER BY created_at ASC").all(req.user.id,date);
-    res.json({ success:true, date, invoices, payments, summary:{ total_sales:invoices.filter(i=>i.invoice_type==="SALES").reduce((a,i)=>a+(i.total_amount||0),0), total_purchases:invoices.filter(i=>i.invoice_type==="PURCHASE").reduce((a,i)=>a+(i.total_amount||0),0), total_received:payments.filter(p=>p.type==="RECEIVED").reduce((a,p)=>a+(p.amount||0),0), total_paid:payments.filter(p=>p.type==="PAID").reduce((a,p)=>a+(p.amount||0),0) } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-// ══════════════════════════════════════════════════════════════════════════
-// ── BANK STATEMENT ────────────────────────────────────────────────────────
-// ══════════════════════════════════════════════════════════════════════════
-const guessCategory = (desc) => {
-  const d = (desc||"").toLowerCase();
-  if (d.includes("salary")||d.includes("payroll")||d.includes("wages")) return "Salary";
-  if (d.includes("rent")) return "Rent";
-  if (d.includes("gst")||d.includes("tds")) return "Tax Payment";
-  if (d.includes("electricity")||d.includes("water")||d.includes("utility")||d.includes("bescom")||d.includes("bses")) return "Utilities";
-  if (d.includes("neft")||d.includes("rtgs")||d.includes("imps")) return "Fund Transfer";
-  if (d.includes("atm")||d.includes("cash")) return "Cash";
-  if (d.includes("emi")||d.includes("loan")) return "Loan Payment";
-  if (d.includes("interest")||d.includes("int ")) return "Interest";
-  if (d.includes("charges")||d.includes("fee")||d.includes("commission")) return "Bank Charges";
-  if (d.includes("insurance")||d.includes("premium")||d.includes("lic")) return "Insurance";
-  if (d.includes("purchase")||d.includes("vendor")||d.includes("supplier")) return "Purchase";
-  if (d.includes("sale")||d.includes("receipt")||d.includes("payment rcv")) return "Sales Receipt";
-  if (d.includes("amazon")||d.includes("flipkart")||d.includes("online")) return "Online Purchase";
-  if (d.includes("petrol")||d.includes("fuel")||d.includes("diesel")) return "Fuel";
-  if (d.includes("medical")||d.includes("hospital")||d.includes("pharma")) return "Medical";
-  if (d.includes("swiggy")||d.includes("zomato")||d.includes("food")) return "Food & Dining";
-  if (d.includes("travel")||d.includes("flight")||d.includes("hotel")) return "Travel";
-  return "Uncategorized";
-};
-
-const guessType = (desc, isDebit) => {
-  const d = (desc||"").toLowerCase();
-  if (d.includes("gst")||d.includes("tds")||d.includes("tax")) return "TAX";
-  if (d.includes("neft")||d.includes("rtgs")||d.includes("imps")||d.includes("transfer")) return "TRANSFER";
-  if (d.includes("emi")||d.includes("loan")||d.includes("charges")||d.includes("fee")) return "BANK";
-  if (!isDebit) return "INCOME";
-  if (d.includes("salary")||d.includes("rent")||d.includes("utility")||d.includes("vendor")) return "EXPENSE";
-  if (d.includes("purchase")||d.includes("supplier")) return "PURCHASE";
-  return isDebit ? "EXPENSE" : "INCOME";
-};
-
-const parseTransactions = (text) => {
-  const lines = text.split("\n").map(l=>l.trim()).filter(l=>l.length>5);
-  const transactions = [];
-  const dateReg = /(\d{2}[\/\-]\d{2}[\/\-]\d{4}|\d{2}[\/\-]\d{2}[\/\-]\d{2}|\d{2}\s+[A-Za-z]{3}\s+\d{4})/;
-  const amtReg  = /(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)/g;
-
-  for (const line of lines) {
-    const dateMatch = line.match(dateReg);
-    if (!dateMatch) continue;
-    const dateStr = dateMatch[1];
-    const amounts = [];
-    let m;
-    while ((m=amtReg.exec(line))!==null) {
-      const v = parseFloat(m[1].replace(/,/g,""));
-      if (v>0) amounts.push(v);
+app.post("/api/accounting/companies/:cid/vouchers",auth,async(req,res)=>{
+  try{
+    const{voucher_type,date,ref_no,narration,party_ledger_id,party_name,items=[]}=req.body;
+    if(!voucher_type||!date)return res.status(400).json({success:false,message:"Voucher type and date required"});
+    if(items.length<2)return res.status(400).json({success:false,message:"Minimum 2 ledger entries required (double-entry bookkeeping)"});
+    const totalDr=items.reduce((a,i)=>a+parseFloat(i.dr_amount||0),0);
+    const totalCr=items.reduce((a,i)=>a+parseFloat(i.cr_amount||0),0);
+    if(Math.abs(totalDr-totalCr)>0.01)return res.status(400).json({success:false,message:`Voucher not balanced! Dr: Rs.${totalDr.toFixed(2)}, Cr: Rs.${totalCr.toFixed(2)}, Diff: Rs.${Math.abs(totalDr-totalCr).toFixed(2)}`});
+    const id=uuid();
+    const voucher_no=await genVoucherNo(req.params.cid,voucher_type);
+    await pool.query("INSERT INTO vouchers (id,user_id,company_id,voucher_no,voucher_type,date,ref_no,narration,party_ledger_id,party_name,total_amount) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+      [id,req.user.id,req.params.cid,voucher_no,voucher_type,date,ref_no||null,narration||null,party_ledger_id||null,party_name||null,totalDr]);
+    for(let idx=0;idx<items.length;idx++){
+      const item=items[idx];
+      const ledger=await pool.query("SELECT id,name FROM ledgers WHERE id=$1",[item.ledger_id]);
+      if(!ledger.rows[0])throw new Error(`Ledger not found: ${item.ledger_id}`);
+      await pool.query("INSERT INTO voucher_items (id,voucher_id,ledger_id,ledger_name,dr_amount,cr_amount,narration,sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        [uuid(),id,item.ledger_id,ledger.rows[0].name,parseFloat(item.dr_amount)||0,parseFloat(item.cr_amount)||0,item.narration||null,idx]);
     }
-    if (amounts.length<2) continue;
-    let desc = line.replace(dateStr,"").replace(/\d{1,3}(?:,\d{3})*(?:\.\d{2})?/g,"").replace(/[Dr|Cr]+/g,"").replace(/\s+/g," ").trim();
-    if (!desc||desc.length<3) continue;
-    const isDebit = line.toLowerCase().includes("dr") || line.toLowerCase().includes("debit");
-    const debit  = isDebit ? amounts[amounts.length-3]||amounts[0]||0 : 0;
-    const credit = !isDebit ? amounts[amounts.length-2]||amounts[0]||0 : 0;
-    const category = guessCategory(desc);
-    const type     = guessType(desc, isDebit);
-    transactions.push({ txn_date:dateStr.replace(/(\d{2})[\/\-](\d{2})[\/\-](\d{2,4})/,(_,d,mo,y)=>`${y.length===2?"20"+y:y}-${mo}-${d}`), description:desc.substring(0,200), debit, credit, balance:amounts[amounts.length-1]||0, category, type });
-  }
-  return transactions;
-};
-
-app.post("/api/bank/upload", upload.single("file"), auth, async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ success:false, message:"PDF file required" });
-    let text = "";
-    try {
-      const pdfParse = require("pdf-parse");
-      const data = await pdfParse(req.file.buffer);
-      text = data.text;
-    } catch(e) { return res.status(400).json({ success:false, message:"Could not read PDF. Use a digital PDF, not scanned." }); }
-    if (!text||text.length<50) return res.status(400).json({ success:false, message:"No text found in PDF." });
-    const transactions = parseTransactions(text);
-    if (transactions.length===0) return res.status(400).json({ success:false, message:"No transactions found. Ensure this is a bank statement PDF." });
-    const totalDebit  = transactions.reduce((a,t)=>a+(t.debit||0),0);
-    const totalCredit = transactions.reduce((a,t)=>a+(t.credit||0),0);
-    res.json({ success:true, message:`Found ${transactions.length} transactions`, preview:{ bank_name:req.body.bank_name||"Unknown Bank", account_no:req.body.account_no||"", total_txns:transactions.length, total_debit:totalDebit, total_credit:totalCredit, transactions } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+    const voucher=await pool.query("SELECT * FROM vouchers WHERE id=$1",[id]);
+    const vItems=await pool.query("SELECT * FROM voucher_items WHERE voucher_id=$1 ORDER BY sort_order ASC",[id]);
+    res.status(201).json({success:true,message:`Voucher ${voucher_no} created successfully`,voucher:{...voucher.rows[0],items:vItems.rows}});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
 });
+app.patch("/api/accounting/companies/:cid/vouchers/:id/cancel",auth,async(req,res)=>{try{await pool.query("UPDATE vouchers SET is_cancelled=TRUE,updated_at=NOW() WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);res.json({success:true,message:"Voucher cancelled"});}catch(e){res.status(500).json({success:false,message:e.message});}});
+app.delete("/api/accounting/companies/:cid/vouchers/:id",auth,async(req,res)=>{try{await pool.query("DELETE FROM voucher_items WHERE voucher_id=$1",[req.params.id]);await pool.query("DELETE FROM vouchers WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);res.json({success:true,message:"Deleted"});}catch(e){res.status(500).json({success:false,message:e.message});}});
 
-app.post("/api/bank/import", auth, (req, res) => {
-  try {
-    const { bank_name, account_no, transactions } = req.body;
-    if (!transactions||transactions.length===0) return res.status(400).json({ success:false, message:"No transactions" });
-    const importId = uuid();
-    const totalDebit  = transactions.reduce((a,t)=>a+(t.debit||0),0);
-    const totalCredit = transactions.reduce((a,t)=>a+(t.credit||0),0);
-    db.prepare("INSERT INTO bank_imports (id,user_id,bank_name,account_no,total_txns,total_debit,total_credit,filename) VALUES (?,?,?,?,?,?,?,?)").run(importId,req.user.id,bank_name||"Unknown",account_no||"",transactions.length,totalDebit,totalCredit,`statement_${Date.now()}.pdf`);
-    const insertTxn = db.prepare("INSERT INTO bank_transactions (id,user_id,bank_name,account_no,txn_date,description,debit,credit,balance,category,type,import_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
-    const insertMany = db.transaction((txns) => { for (const t of txns) insertTxn.run(uuid(),req.user.id,bank_name||"Unknown",account_no||"",t.txn_date,t.description,t.debit||0,t.credit||0,t.balance||0,t.category||"Uncategorized",t.type||"UNKNOWN",importId); });
-    insertMany(transactions);
-    res.json({ success:true, message:`${transactions.length} transactions imported successfully!`, import_id:importId });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
+// ══ ACCOUNTING: REPORTS ══
+app.get("/api/accounting/companies/:cid/reports/trial-balance",auth,async(req,res)=>{
+  try{
+    const{from_date,to_date}=req.query;
+    const ledgers=await pool.query("SELECT l.*,g.name as group_name,g.nature FROM ledgers l JOIN ledger_groups g ON l.group_id=g.id WHERE l.company_id=$1 AND l.user_id=$2",[req.params.cid,req.user.id]);
+    let totalDr=0,totalCr=0;
+    const rows=await Promise.all(ledgers.rows.map(async l=>{
+      let q="SELECT COALESCE(SUM(dr_amount),0) as dr,COALESCE(SUM(cr_amount),0) as cr FROM voucher_items vi JOIN vouchers v ON vi.voucher_id=v.id WHERE vi.ledger_id=$1 AND v.is_cancelled=FALSE";
+      const p=[l.id];if(from_date){q+=` AND v.date>=$${p.length+1}`;p.push(from_date);}if(to_date){q+=` AND v.date<=$${p.length+1}`;p.push(to_date);}
+      const txn=await pool.query(q,p);
+      const opDr=l.opening_type==="Dr"?parseFloat(l.opening_balance):0,opCr=l.opening_type==="Cr"?parseFloat(l.opening_balance):0;
+      const nDr=opDr+parseFloat(txn.rows[0].dr||0),nCr=opCr+parseFloat(txn.rows[0].cr||0);
+      const bal=Math.abs(nDr-nCr),bt=nDr>=nCr?"Dr":"Cr";
+      if(bal>0){if(bt==="Dr")totalDr+=bal;else totalCr+=bal;}
+      return{id:l.id,name:l.name,group:l.group_name,nature:l.nature,dr_amount:nDr>=nCr?bal:0,cr_amount:nCr>nDr?bal:0,balance:bal,balance_type:bt};
+    }));
+    res.json({success:true,rows:rows.filter(r=>r.balance>0),totals:{dr:totalDr,cr:totalCr,balanced:Math.abs(totalDr-totalCr)<0.01}});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
 });
-
-app.get("/api/bank/transactions", auth, (req, res) => {
-  try {
-    const { type, from_date, to_date, search } = req.query;
-    let q = "SELECT * FROM bank_transactions WHERE user_id=?";
-    const params = [req.user.id];
-    if (type&&type!=="all") { q+=" AND type=?"; params.push(type); }
-    if (from_date) { q+=" AND txn_date>=?"; params.push(from_date); }
-    if (to_date)   { q+=" AND txn_date<=?"; params.push(to_date); }
-    if (search)    { q+=" AND description LIKE ?"; params.push(`%${search}%`); }
-    q+=" ORDER BY txn_date DESC, created_at DESC";
-    const rows = db.prepare(q).all(...params);
-    const totalDebit  = rows.reduce((a,t)=>a+(t.debit||0),0);
-    const totalCredit = rows.reduce((a,t)=>a+(t.credit||0),0);
-    res.json({ success:true, count:rows.length, transactions:rows, summary:{ total_debit:totalDebit, total_credit:totalCredit, net:totalCredit-totalDebit } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.get("/api/bank/imports", auth, (req, res) => {
-  try {
-    const rows = db.prepare("SELECT * FROM bank_imports WHERE user_id=? ORDER BY created_at DESC").all(req.user.id);
-    res.json({ success:true, imports:rows });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.patch("/api/bank/transactions/:id", auth, (req, res) => {
-  try {
-    const { category, type, notes } = req.body;
-    db.prepare("UPDATE bank_transactions SET category=?,type=?,notes=? WHERE id=? AND user_id=?").run(category,type,notes||null,req.params.id,req.user.id);
-    res.json({ success:true, message:"Updated" });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-// ══════════════════════════════════════════════════════════════════════════
-// ── AI ROUTES ─────────────────────────────────────────────────────────────
-// ══════════════════════════════════════════════════════════════════════════
-app.post("/api/ai/chat", auth, async (req, res) => {
-  try {
-    const reply = await callGroq(req.body.messages||[], "You are an expert Indian GST consultant and accounting professional. Help with GST compliance, ITC, notices, returns, reconciliation, and accounting queries. Be concise and cite relevant sections. Use Rs. for rupees.");
-    res.json({ success:true, reply });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.post("/api/ai/generate-reply", auth, async (req, res) => {
-  try {
-    const { client_name, gstin, notice_type, ref_no, amount, description } = req.body;
-    const prompt = `Generate a professional GST notice reply:\nClient: ${client_name}\nGSTIN: ${gstin}\nNotice Type: ${notice_type}\nRef No: ${ref_no}\nAmount: Rs.${amount}\nDetails: ${description||"Not provided"}\n\nWrite a formal reply citing relevant CGST Act sections.`;
-    const reply = await callGroq([{ role:"user", content:prompt }], "You are an expert GST lawyer. Write formal, professional notice replies to GST department notices.");
-    res.json({ success:true, reply });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-// ── CHALLANS ──────────────────────────────────────────────────────────────
-app.get("/api/challans", auth, (req, res) => {
-  try {
-    const rows = db.prepare("SELECT ch.*,c.name as client_name,c.gstin FROM challans ch JOIN clients c ON ch.client_id=c.id WHERE ch.user_id=? ORDER BY ch.created_at DESC").all(req.user.id);
-    res.json({ success:true, challans:rows });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.post("/api/challans", auth, (req, res) => {
-  try {
-    const { client_id, challan_no, type, amount, period, payment_date, notes } = req.body;
-    const id = uuid();
-    db.prepare("INSERT INTO challans (id,user_id,client_id,challan_no,type,amount,period,payment_date,notes) VALUES (?,?,?,?,?,?,?,?,?)").run(id,req.user.id,client_id,challan_no,type,parseFloat(amount)||0,period||null,payment_date,notes||null);
-    res.status(201).json({ success:true, message:"Challan added" });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.delete("/api/challans/:id", auth, (req, res) => {
-  try {
-    db.prepare("DELETE FROM challans WHERE id=? AND user_id=?").run(req.params.id,req.user.id);
-    res.json({ success:true, message:"Deleted" });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-// ── IMPORT EXCEL ──────────────────────────────────────────────────────────
-app.post("/api/import/clients", upload.single("file"), auth, (req, res) => {
-  try {
-    const wb = XLSX.read(req.file.buffer,{ type:"buffer" });
-    const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
-    let imported=0, skipped=0;
-    for (const row of rows) {
-      const gstin=(row["GSTIN"]||row["gstin"]||"").toString().trim().toUpperCase();
-      const name=(row["Name"]||row["name"]||row["Trade Name"]||"").toString().trim();
-      if (!gstin||!name){ skipped++; continue; }
-      const exists=db.prepare("SELECT id FROM clients WHERE user_id=? AND gstin=?").get(req.user.id,gstin);
-      if (exists){ skipped++; continue; }
-      db.prepare("INSERT INTO clients (id,user_id,name,gstin,state,type,status) VALUES (?,?,?,?,?,?,'compliant')").run(uuid(),req.user.id,name,gstin,(row["State"]||row["state"]||"").toString().trim(),(row["Type"]||row["type"]||"Trader").toString().trim());
-      imported++;
+app.get("/api/accounting/companies/:cid/reports/profit-loss",auth,async(req,res)=>{
+  try{
+    const{from_date,to_date}=req.query;
+    const ledgers=await pool.query("SELECT l.*,g.nature,g.affects_gross FROM ledgers l JOIN ledger_groups g ON l.group_id=g.id WHERE l.company_id=$1 AND l.user_id=$2",[req.params.cid,req.user.id]);
+    let totalIncome=0,totalExpense=0;
+    const sales=[],purchase=[],directExp=[],indirectInc=[],indirectExp=[];
+    for(const l of ledgers.rows){
+      let q="SELECT COALESCE(SUM(dr_amount),0) as dr,COALESCE(SUM(cr_amount),0) as cr FROM voucher_items vi JOIN vouchers v ON vi.voucher_id=v.id WHERE vi.ledger_id=$1 AND v.is_cancelled=FALSE";
+      const p=[l.id];if(from_date){q+=` AND v.date>=$${p.length+1}`;p.push(from_date);}if(to_date){q+=` AND v.date<=$${p.length+1}`;p.push(to_date);}
+      const txn=await pool.query(q,p);
+      const nDr=parseFloat(txn.rows[0].dr||0),nCr=parseFloat(txn.rows[0].cr||0);
+      if(l.nature==="Income"){const amt=nCr-nDr;if(amt===0)continue;if(l.affects_gross){sales.push({name:l.name,amount:amt});}else{indirectInc.push({name:l.name,amount:amt});}totalIncome+=amt;}
+      else if(l.nature==="Expense"){const amt=nDr-nCr;if(amt===0)continue;if(l.affects_gross){purchase.push({name:l.name,amount:amt});directExp.push({name:l.name,amount:amt});}else{indirectExp.push({name:l.name,amount:amt});}totalExpense+=amt;}
     }
-    res.json({ success:true, message:`${imported} clients imported, ${skipped} skipped` });
-  } catch(e) { res.status(500).json({ success:false, message:"Import failed: "+e.message }); }
+    const grossProfit=sales.reduce((a,s)=>a+s.amount,0)-purchase.reduce((a,s)=>a+s.amount,0);
+    const netProfit=totalIncome-totalExpense;
+    res.json({success:true,report:{sales,purchase,direct_expenses:directExp,indirect_income:indirectInc,indirect_expenses:indirectExp,gross_profit:grossProfit,net_profit:netProfit,total_income:totalIncome,total_expense:totalExpense}});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
 });
-
-// ── GSTR-2A PREVIEW & IMPORT ──────────────────────────────────────────────
-app.post("/api/gstr2a/preview", upload.single("file"), auth, (req, res) => {
-  try {
-    const wb = XLSX.read(req.file.buffer,{ type:"buffer" });
-    const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval:"" });
-    const grouped = {};
-    for (const row of rows) {
-      const gstin=(row["GSTIN of Supplier"]||row["GSTIN"]||row["gstin"]||row["ctin"]||"").toString().trim().toUpperCase();
-      if (!gstin||gstin.length<15) continue;
-      const name=(row["Trade/Legal name of the Supplier"]||row["Trade Name"]||row["Supplier Name"]||row["trdnm"]||"").toString().trim();
-      const igst=parseFloat(row["Integrated Tax Amount"]||row["IGST Amount"]||row["iamt"]||0)||0;
-      const cgst=parseFloat(row["Central Tax Amount"]||row["CGST Amount"]||row["camt"]||0)||0;
-      const sgst=parseFloat(row["State/UT Tax Amount"]||row["SGST Amount"]||row["samt"]||0)||0;
-      const itc=igst+cgst+sgst;
-      if (!grouped[gstin]) grouped[gstin]={ gstin, name, invoices:0, igst:0, cgst:0, sgst:0, itc:0 };
-      grouped[gstin].invoices++; grouped[gstin].igst+=igst; grouped[gstin].cgst+=cgst; grouped[gstin].sgst+=sgst; grouped[gstin].itc+=itc;
+app.get("/api/accounting/companies/:cid/reports/balance-sheet",auth,async(req,res)=>{
+  try{
+    const{as_on_date}=req.query;
+    const ledgers=await pool.query("SELECT l.*,g.name as group_name,g.nature FROM ledgers l JOIN ledger_groups g ON l.group_id=g.id WHERE l.company_id=$1 AND l.user_id=$2",[req.params.cid,req.user.id]);
+    const assets=[],liabilities=[];let totalAssets=0,totalLiabilities=0;
+    for(const l of ledgers.rows){
+      let q="SELECT COALESCE(SUM(dr_amount),0) as dr,COALESCE(SUM(cr_amount),0) as cr FROM voucher_items vi JOIN vouchers v ON vi.voucher_id=v.id WHERE vi.ledger_id=$1 AND v.is_cancelled=FALSE";
+      const p=[l.id];if(as_on_date){q+=` AND v.date<=$${p.length+1}`;p.push(as_on_date);}
+      const txn=await pool.query(q,p);
+      const opDr=l.opening_type==="Dr"?parseFloat(l.opening_balance):0,opCr=l.opening_type==="Cr"?parseFloat(l.opening_balance):0;
+      const nDr=opDr+parseFloat(txn.rows[0].dr||0),nCr=opCr+parseFloat(txn.rows[0].cr||0);
+      const bal=Math.abs(nDr-nCr);if(bal===0)continue;
+      const bt=nDr>=nCr?"Dr":"Cr";
+      const entry={name:l.name,group:l.group_name,balance:bal,balance_type:bt};
+      if(l.nature==="Asset"){assets.push(entry);totalAssets+=bal;}
+      else if(l.nature==="Liability"){liabilities.push(entry);totalLiabilities+=bal;}
     }
-    const suppliers=Object.values(grouped);
-    res.json({ success:true, preview:{ total_invoices:rows.length, total_suppliers:suppliers.length, total_itc:suppliers.reduce((a,s)=>a+s.itc,0), suppliers } });
-  } catch(e) { res.status(500).json({ success:false, message:"Preview failed: "+e.message }); }
+    res.json({success:true,as_on_date:as_on_date||new Date().toISOString().split("T")[0],assets,liabilities,total_assets:totalAssets,total_liabilities:totalLiabilities,difference:Math.abs(totalAssets-totalLiabilities)});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.get("/api/accounting/companies/:cid/reports/day-book",auth,async(req,res)=>{
+  try{
+    const date=req.query.date||new Date().toISOString().split("T")[0];
+    const vouchers=await pool.query("SELECT * FROM vouchers WHERE company_id=$1 AND user_id=$2 AND date=$3 AND is_cancelled=FALSE ORDER BY created_at ASC",[req.params.cid,req.user.id,date]);
+    const withItems=await Promise.all(vouchers.rows.map(async v=>{const items=await pool.query("SELECT * FROM voucher_items WHERE voucher_id=$1 ORDER BY sort_order ASC",[v.id]);return{...v,items:items.rows};}));
+    const td=withItems.reduce((a,v)=>a+v.items.reduce((b,i)=>b+parseFloat(i.dr_amount||0),0),0);
+    const tc=withItems.reduce((a,v)=>a+v.items.reduce((b,i)=>b+parseFloat(i.cr_amount||0),0),0);
+    res.json({success:true,date,vouchers:withItems,summary:{total_vouchers:vouchers.rows.length,total_dr:td,total_cr:tc}});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.get("/api/accounting/companies/:cid/reports/cash-book",auth,async(req,res)=>{
+  try{
+    const{from_date,to_date}=req.query;
+    const cl=await pool.query("SELECT l.* FROM ledgers l JOIN ledger_groups g ON l.group_id=g.id WHERE l.company_id=$1 AND l.user_id=$2 AND l.name='Cash' LIMIT 1",[req.params.cid,req.user.id]);
+    if(!cl.rows[0])return res.status(404).json({success:false,message:"Cash ledger not found"});
+    let q="SELECT vi.*,v.date,v.voucher_no,v.voucher_type,v.narration as v_narration,v.party_name FROM voucher_items vi JOIN vouchers v ON vi.voucher_id=v.id WHERE vi.ledger_id=$1 AND v.is_cancelled=FALSE";
+    const p=[cl.rows[0].id];if(from_date){q+=` AND v.date>=$${p.length+1}`;p.push(from_date);}if(to_date){q+=` AND v.date<=$${p.length+1}`;p.push(to_date);}q+=" ORDER BY v.date ASC";
+    const txns=await pool.query(q,p);
+    const td=txns.rows.reduce((a,t)=>a+parseFloat(t.dr_amount||0),0),tc=txns.rows.reduce((a,t)=>a+parseFloat(t.cr_amount||0),0);
+    const op=parseFloat(cl.rows[0].opening_balance),opDr=cl.rows[0].opening_type==="Dr"?op:0,closing=opDr+td-tc;
+    res.json({success:true,ledger:cl.rows[0],transactions:txns.rows,summary:{opening:op,opening_type:cl.rows[0].opening_type,total_receipts:td,total_payments:tc,closing:Math.abs(closing),closing_type:closing>=0?"Dr":"Cr"}});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.post("/api/gstr2a/import", upload.single("file"), auth, (req, res) => {
-  try {
-    const { client_id, period } = req.body;
-    const wb = XLSX.read(req.file.buffer,{ type:"buffer" });
-    const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval:"" });
-    const grouped = {};
-    for (const row of rows) {
-      const gstin=(row["GSTIN of Supplier"]||row["GSTIN"]||row["gstin"]||row["ctin"]||"").toString().trim().toUpperCase();
-      if (!gstin||gstin.length<15) continue;
-      const name=(row["Trade/Legal name of the Supplier"]||row["Trade Name"]||row["trdnm"]||"").toString().trim();
-      const itc=(parseFloat(row["Integrated Tax Amount"]||row["iamt"]||0)||0)+(parseFloat(row["Central Tax Amount"]||row["camt"]||0)||0)+(parseFloat(row["State/UT Tax Amount"]||row["samt"]||0)||0);
-      if (!grouped[gstin]) grouped[gstin]={ gstin, name, count:0, itc:0 };
-      grouped[gstin].count++; grouped[gstin].itc+=itc;
-    }
-    const suppliers=Object.values(grouped);
-    let saved=0;
-    for (const s of suppliers) {
-      const diff=s.itc-0, status="mismatch";
-      db.prepare("INSERT OR IGNORE INTO reconciliation (id,user_id,client_id,period,vendor_name,vendor_gstin,invoice_count,gstr2a_amount,gstr2b_amount,books_amount,difference,status,remarks) VALUES (?,?,?,?,?,?,?,?,?,0,?,?,'Imported from GSTR-2A')").run(uuid(),req.user.id,client_id,period,s.name,s.gstin,s.count,s.itc,s.itc,diff,status);
-      saved++;
-    }
-    res.json({ success:true, message:`${saved} suppliers imported to Reconciliation!`, summary:{ total_invoices:rows.length, saved, total_itc:suppliers.reduce((a,s)=>a+s.itc,0) } });
-  } catch(e) { res.status(500).json({ success:false, message:"Import failed: "+e.message }); }
+// ══ GODOWNS ══
+app.get("/api/accounting/companies/:cid/godowns",auth,async(req,res)=>{try{const r=await pool.query("SELECT * FROM godowns WHERE company_id=$1 AND user_id=$2 ORDER BY name ASC",[req.params.cid,req.user.id]);res.json({success:true,godowns:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}});
+app.post("/api/accounting/companies/:cid/godowns",auth,async(req,res)=>{try{const{name,address}=req.body;if(!name)return res.status(400).json({success:false,message:"Name required"});const id=uuid();await pool.query("INSERT INTO godowns (id,user_id,company_id,name,address) VALUES ($1,$2,$3,$4,$5)",[id,req.user.id,req.params.cid,name,address||null]);res.status(201).json({success:true,message:"Godown created"});}catch(e){res.status(500).json({success:false,message:e.message});}});
+
+// ══ HEALTH ══
+app.get("/health",(req,res)=>res.json({success:true,message:"TaxPro Complete v4.0 - PostgreSQL",db:"PostgreSQL",version:"4.0.0"}));
+app.use((req,res)=>res.status(404).json({success:false,message:`Route ${req.method} ${req.url} not found`}));
+app.use((err,req,res,next)=>{console.error(err);res.status(500).json({success:false,message:process.env.NODE_ENV==="production"?"Server error":err.message});});
+
+app.listen(PORT,()=>{
+  console.log(`\n🚀 TaxPro Complete v4.0 on port ${PORT}`);
+  console.log(`🗄️  Database: PostgreSQL`);
+  console.log(`\n📌 Routes: Auth | Clients | Notices | Returns | Reconciliation`);
+  console.log(`   Products | Invoices | Parties | Bank | Reports | GSTR-2A`);
+  console.log(`   AI | Challans | Staff | GSTIN`);
+  console.log(`   Accounting: Companies | Groups | Ledgers | Vouchers`);
+  console.log(`   Reports: Trial Balance | P&L | Balance Sheet | Day Book | Cash Book\n`);
 });
-
-// ── GSTIN VERIFY ──────────────────────────────────────────────────────────
-const STATES_MAP = {"01":"Jammu & Kashmir","02":"Himachal Pradesh","03":"Punjab","04":"Chandigarh","05":"Uttarakhand","06":"Haryana","07":"Delhi","08":"Rajasthan","09":"Uttar Pradesh","10":"Bihar","11":"Sikkim","18":"Assam","19":"West Bengal","20":"Jharkhand","21":"Odisha","22":"Chhattisgarh","23":"Madhya Pradesh","24":"Gujarat","27":"Maharashtra","29":"Karnataka","30":"Goa","32":"Kerala","33":"Tamil Nadu","36":"Telangana","37":"Andhra Pradesh"};
-app.get("/api/gstin/validate/:gstin", auth, (req, res) => {
-  const g = req.params.gstin.toUpperCase().trim();
-  const valid = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/.test(g);
-  if (!valid) return res.json({ success:true, valid:false, message:"Invalid GSTIN format" });
-  res.json({ success:true, valid:true, message:"Valid GSTIN format", details:{ gstin:g, state_code:g.substring(0,2), state:STATES_MAP[g.substring(0,2)]||"Unknown", pan:g.substring(2,12) } });
-});
-
-// ── STAFF ─────────────────────────────────────────────────────────────────
-app.get("/api/staff", auth, (req, res) => {
-  try {
-    const rows = db.prepare("SELECT id,name,email,role,firm_name,created_at FROM users WHERE parent_id=?").all(req.user.id);
-    res.json({ success:true, staff:rows });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.post("/api/staff", auth, async (req, res) => {
-  try {
-    const { name, email, password } = req.body;
-    if (!name||!email||!password) return res.status(400).json({ success:false, message:"All fields required" });
-    const exists = db.prepare("SELECT id FROM users WHERE email=?").get(email.toLowerCase());
-    if (exists) return res.status(409).json({ success:false, message:"Email already exists" });
-    const hashed = await bcrypt.hash(password, 12);
-    const id = uuid();
-    db.prepare("INSERT INTO users (id,name,email,password,firm_name,role,parent_id) VALUES (?,?,?,?,?,'staff',?)").run(id,name,email.toLowerCase(),hashed,req.user.firm_name,req.user.id);
-    res.status(201).json({ success:true, message:"Staff added", staff:{ id,name,email,role:"staff" } });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-app.delete("/api/staff/:id", auth, (req, res) => {
-  try {
-    db.prepare("DELETE FROM users WHERE id=? AND parent_id=?").run(req.params.id,req.user.id);
-    res.json({ success:true, message:"Staff removed" });
-  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
-});
-
-// ── Health ────────────────────────────────────────────────────────────────
-app.get("/health", (req, res) => res.json({ success:true, message:"TaxPro Complete v3.0", db:"SQLite" }));
-app.use((req, res) => res.status(404).json({ success:false, message:`Route ${req.method} ${req.url} not found` }));
-
-app.listen(PORT, () => {
-  console.log(`\n🚀 TaxPro Complete running on http://localhost:${PORT}`);
-  console.log(`📋 Environment: ${process.env.NODE_ENV||"development"}\n`);
-});
-
-module.exports = app;
+module.exports=app;
