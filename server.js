@@ -213,6 +213,8 @@ const genVoucherNo = async (companyId, type) => {
   const r = await pool.query("SELECT COUNT(*) as c FROM vouchers WHERE company_id=$1 AND voucher_type=$2",[companyId,type]);
   return `${prefix}/${yr}-${mo}/${String(parseInt(r.rows[0].c)+1).padStart(4,"0")}`;
 };
+
+
 const DEFAULT_GROUPS = [
   {name:"Capital Account",nature:"Liability",parent:null,ag:false},
   {name:"Reserves & Surplus",nature:"Liability",parent:"Capital Account",ag:false},
@@ -423,6 +425,8 @@ app.delete("/api/products/:id",auth,async(req,res)=>{
 app.post("/api/products/:id/stock",auth,async(req,res)=>{
   try{const{type,qty,rate,notes}=req.body;const p=await pool.query("SELECT * FROM products WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);if(!p.rows[0])return res.status(404).json({success:false,message:"Not found"});const change=type==="IN"?parseFloat(qty):-parseFloat(qty);const newStock=parseFloat(p.rows[0].stock_qty)+change;if(newStock<0)return res.status(400).json({success:false,message:"Insufficient stock"});await pool.query("UPDATE products SET stock_qty=$1,updated_at=NOW() WHERE id=$2",[newStock,req.params.id]);await pool.query("INSERT INTO stock_movements (id,user_id,product_id,type,qty,rate,notes) VALUES ($1,$2,$3,$4,$5,$6,$7)",[uuid(),req.user.id,req.params.id,type,Math.abs(parseFloat(qty)),parseFloat(rate)||0,notes||null]);res.json({success:true,message:"Stock updated",new_stock:newStock});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
+
+
 // ══ INVOICES ══
 app.get("/api/invoices/stats/summary",auth,async(req,res)=>{
   try{const uid=req.user.id,today=new Date().toISOString().split("T")[0],month=today.substring(0,7);const[s,p,o,ov]=await Promise.all([pool.query("SELECT COALESCE(SUM(total_amount),0) as t FROM invoices WHERE user_id=$1 AND invoice_type='SALES' AND invoice_date LIKE $2",[uid,`${month}%`]),pool.query("SELECT COALESCE(SUM(total_amount),0) as t FROM invoices WHERE user_id=$1 AND invoice_type='PURCHASE' AND invoice_date LIKE $2",[uid,`${month}%`]),pool.query("SELECT COALESCE(SUM(balance_due),0) as t FROM invoices WHERE user_id=$1 AND status IN ('unpaid','partial')",[uid]),pool.query("SELECT COALESCE(SUM(balance_due),0) as t FROM invoices WHERE user_id=$1 AND status IN ('unpaid','partial') AND due_date < $2",[uid,today])]);res.json({success:true,stats:{monthly_sales:parseFloat(s.rows[0].t),monthly_purchases:parseFloat(p.rows[0].t),total_outstanding:parseFloat(o.rows[0].t),overdue_amount:parseFloat(ov.rows[0].t)}});}catch(e){res.status(500).json({success:false,message:e.message});}
@@ -557,13 +561,15 @@ app.post("/api/gstr2a/import",upload.single("file"),auth,async(req,res)=>{
 });
 
 // ══ GSTIN ══
-const STATES_MAP={"35":"Andaman and Nicobar Islands","37":"Andhra Pradesh","12":"Arunachal Pradesh","18":"Assam","10":"Bihar","04":"Chandigarh","22":"Chhattisgarh","26":"Dadra & Nagar Haveli and Daman & Diu","07":"Delhi","30":"Goa","24":"Gujarat","06":"Haryana","02":"Himachal Pradesh","01":"Jammu & Kashmir","20":"Jharkhand","29":"Karnataka","32":"Kerala","38":"Ladakh","31":"Lakshadweep","23":"Madhya Pradesh","27":"Maharashtra","14":"Manipur","17":"Meghalaya","15":"Mizoram","13":"Nagaland","21":"Odisha","34":"Puducherry","03":"Punjab","08":"Rajasthan","11":"Sikkim","33":"Tamil Nadu","36":"Telangana","16":"Tripura","09":"Uttar Pradesh","05":"Uttarakhand","19":"West Bengal"};
+const STATES_MAP={"01":"Jammu & Kashmir","02":"Himachal Pradesh","03":"Punjab","04":"Chandigarh","05":"Uttarakhand","06":"Haryana","07":"Delhi","08":"Rajasthan","09":"Uttar Pradesh","10":"Bihar","18":"Assam","19":"West Bengal","20":"Jharkhand","21":"Odisha","22":"Chhattisgarh","23":"Madhya Pradesh","24":"Gujarat","27":"Maharashtra","29":"Karnataka","30":"Goa","32":"Kerala","33":"Tamil Nadu","36":"Telangana","37":"Andhra Pradesh"};
 app.get("/api/gstin/validate/:gstin",auth,(req,res)=>{const g=req.params.gstin.toUpperCase().trim();const valid=/^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/.test(g);if(!valid)return res.json({success:true,valid:false,message:"Invalid GSTIN format"});res.json({success:true,valid:true,message:"Valid format",details:{gstin:g,state_code:g.substring(0,2),state:STATES_MAP[g.substring(0,2)]||"Unknown",pan:g.substring(2,12)}});});
 
 // ══ STAFF ══
 app.get("/api/staff",auth,async(req,res)=>{try{const r=await pool.query("SELECT id,name,email,role,firm_name,created_at FROM users WHERE parent_id=$1 ORDER BY created_at DESC",[req.user.id]);res.json({success:true,staff:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}});
 app.post("/api/staff",auth,async(req,res)=>{try{const{name,email,password}=req.body;if(!name||!email||!password)return res.status(400).json({success:false,message:"All fields required"});const ex=await pool.query("SELECT id FROM users WHERE email=$1",[email.toLowerCase()]);if(ex.rows[0])return res.status(409).json({success:false,message:"Email exists"});const hashed=await bcrypt.hash(password,12);const id=uuid();await pool.query("INSERT INTO users (id,name,email,password,firm_name,role,parent_id) VALUES ($1,$2,$3,$4,$5,'staff',$6)",[id,name,email.toLowerCase(),hashed,req.user.firm_name,req.user.id]);res.status(201).json({success:true,message:"Staff added",staff:{id,name,email,role:"staff"}});}catch(e){res.status(500).json({success:false,message:e.message});}});
 app.delete("/api/staff/:id",auth,async(req,res)=>{try{await pool.query("DELETE FROM users WHERE id=$1 AND parent_id=$2",[req.params.id,req.user.id]);res.json({success:true,message:"Staff removed"});}catch(e){res.status(500).json({success:false,message:e.message});}});
+
+
 // ══ ACCOUNTING: COMPANIES ══
 app.get("/api/accounting/companies",auth,async(req,res)=>{try{const r=await pool.query("SELECT * FROM companies WHERE user_id=$1 ORDER BY name ASC",[req.user.id]);res.json({success:true,companies:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}});
 app.post("/api/accounting/companies",auth,async(req,res)=>{
