@@ -26,6 +26,28 @@ pool.connect((err, client, release) => {
 });
 
 const initDB = async () => {
+  // ── Run column migrations first (safe to run multiple times) ──
+  const migrations = [
+    "ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS phone TEXT",
+    "ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS email TEXT",
+    "ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS address TEXT",
+    "ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS city TEXT",
+    "ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS pincode TEXT",
+    "ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS pan TEXT",
+    "ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS credit_limit REAL DEFAULT 0",
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS parent_id TEXT",
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS gstin TEXT",
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS phone TEXT",
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS logo_url TEXT",
+    "ALTER TABLE IF EXISTS invoices ADD COLUMN IF NOT EXISTS cess_amount REAL DEFAULT 0",
+    "ALTER TABLE IF EXISTS invoices ADD COLUMN IF NOT EXISTS einvoice_irn TEXT",
+    "ALTER TABLE IF EXISTS invoice_items ADD COLUMN IF NOT EXISTS discount_pct REAL DEFAULT 0",
+  ];
+  for (const sql of migrations) {
+    try { await pool.query(sql); } catch(e) { /* ignore if table doesn't exist yet */ }
+  }
+  console.log("✅ Column migrations done");
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
