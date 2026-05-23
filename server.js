@@ -799,6 +799,90 @@ app.get("/health",(req,res)=>res.json({success:true,message:"TaxPro Complete v4.
 app.use((req,res)=>res.status(404).json({success:false,message:`Route ${req.method} ${req.url} not found`}));
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({success:false,message:process.env.NODE_ENV==="production"?"Server error":err.message});});
 
+// ══ GSTR-1 AUTO-POPULATED ══
+app.get("/api/gstr1/:period",auth,async(req,res)=>{
+  try{
+    const{period}=req.params;const uid=req.user.id;
+    // period format: "Apr-2024" or "2024-04"
+    const[yr,mo]=period.includes("-")?period.split("-"):[null,null];
+    let q="SELECT * FROM invoices WHERE user_id=$1 AND invoice_type='SALES' AND status!='cancelled'";
+    const p=[uid];
+    if(yr&&mo){q+=` AND invoice_date LIKE $${p.length+1}`;p.push(`${yr}-${mo.padStart(2,"0")}%`);}
+    const r=await pool.query(q,p);const invs=r.rows;
+    const b2b=invs.filter(i=>i.party_gstin&&i.party_gstin.length===15);
+    const b2c=invs.filter(i=>!i.party_gstin||i.party_gstin.length!==15);
+    const hsnMap={};
+    for(const inv of invs){
+      const items=await pool.query("SELECT * FROM invoice_items WHERE invoice_id=$1",[inv.id]);
+      for(const item of items.rows){
+        const hsn=item.hsn_sac||"0000";
+        if(!hsnMap[hsn])hsnMap[hsn]={hsn_sc:hsn,uqc:"NOS",total_qty:0,total_val:0,taxable_val:0,igst:0,cgst:0,sgst:0,cess:0};
+        hsnMap[hsn].total_qty+=parseFloat(item.qty||0);
+        hsnMap[hsn].total_val+=parseFloat(item.total_amount||0);
+        hsnMap[hsn].taxable_val+=parseFloat(item.taxable_value||0);
+        hsnMap[hsn].igst+=parseFloat(item.igst_amount||0);
+        hsnMap[hsn].cgst+=parseFloat(item.cgst_amount||0);
+        hsnMap[hsn].sgst+=parseFloat(item.sgst_amount||0);
+      }
+    }
+    res.json({success:true,period,b2b,b2c,hsn_summary:Object.values(hsnMap),summary:{total_invoices:invs.length,b2b_count:b2b.length,b2c_count:b2c.length,total_taxable:invs.reduce((a,i)=>a+parseFloat(i.taxable_amount||0),0),total_igst:invs.reduce((a,i)=>a+parseFloat(i.igst_amount||0),0),total_cgst:invs.reduce((a,i)=>a+parseFloat(i.cgst_amount||0),0),total_sgst:invs.reduce((a,i)=>a+parseFloat(i.sgst_amount||0),0),total_tax:invs.reduce((a,i)=>a+parseFloat(i.total_tax||0),0),total_amount:invs.reduce((a,i)=>a+parseFloat(i.total_amount||0),0)}});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ══ GSTR-3B AUTO-POPULATED ══
+app.get("/api/gstr3b/:period",auth,async(req,res)=>{
+  try{
+    const uid=req.user.id;const{period}=req.params;
+    const[yr,mo]=period.split("-");
+    const likeStr=`${yr}-${mo.padStart(2,"0")}%`;
+    const sales=await pool.query("SELECT COALESCE(SUM(taxable_amount),0) as t,COALESCE(SUM(igst_amount),0) as igst,COALESCE(SUM(cgst_amount),0) as cgst,COALESCE(SUM(sgst_amount),0) as sgst FROM invoices WHERE user_id=$1 AND invoice_type='SALES' AND invoice_date LIKE $2",[uid,likeStr]);
+    const purchase=await pool.query("SELECT COALESCE(SUM(taxable_amount),0) as t,COALESCE(SUM(igst_amount),0) as igst,COALESCE(SUM(cgst_amount),0) as cgst,COALESCE(SUM(sgst_amount),0) as sgst FROM invoices WHERE user_id=$1 AND invoice_type='PURCHASE' AND invoice_date LIKE $2",[uid,likeStr]);
+    const s=sales.rows[0],pu=purchase.rows[0];
+    const outputIGST=parseFloat(s.igst||0),outputCGST=parseFloat(s.cgst||0),outputSGST=parseFloat(s.sgst||0);
+    const inputIGST=parseFloat(pu.igst||0),inputCGST=parseFloat(pu.cgst||0),inputSGST=parseFloat(pu.sgst||0);
+    const netIGST=outputIGST-inputIGST,netCGST=outputCGST-inputCGST,netSGST=outputSGST-inputSGST;
+    res.json({success:true,period,
+      table31:{outward_taxable_supplies:parseFloat(s.t||0),igst:outputIGST,cgst:outputCGST,sgst:outputSGST,cess:0},
+      table4:{itc_igst:inputIGST,itc_cgst:inputCGST,itc_sgst:inputSGST,itc_cess:0,total_itc:inputIGST+inputCGST+inputSGST},
+      table6:{igst_payable:Math.max(0,netIGST),cgst_payable:Math.max(0,netCGST),sgst_payable:Math.max(0,netSGST),total_payable:Math.max(0,netIGST)+Math.max(0,netCGST)+Math.max(0,netSGST)}
+    });
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ══ E-INVOICE ══
+app.get("/api/einvoice",auth,async(req,res)=>{
+  try{const r=await pool.query("SELECT * FROM invoices WHERE user_id=$1 AND invoice_type='SALES' ORDER BY created_at DESC LIMIT 50",[req.user.id]);res.json({success:true,invoices:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/einvoice/generate",auth,async(req,res)=>{
+  try{
+    const{invoice_id}=req.body;
+    const inv=await pool.query("SELECT * FROM invoices WHERE id=$1 AND user_id=$2",[invoice_id,req.user.id]);
+    if(!inv.rows[0])return res.status(404).json({success:false,message:"Invoice not found"});
+    // Mock IRN generation (in production, call NIC API)
+    const irn=`IRN${Date.now()}${Math.random().toString(36).substring(2,10).toUpperCase()}`;
+    const ack_no=`ACK${Date.now()}`;
+    const ack_date=new Date().toISOString().split("T")[0];
+    await pool.query("UPDATE invoices SET einvoice_irn=$1,updated_at=NOW() WHERE id=$2",[irn,invoice_id]);
+    res.json({success:true,message:"E-Invoice generated!",irn,ack_no,ack_date,invoice_no:inv.rows[0].invoice_no,party_name:inv.rows[0].party_name,total_amount:inv.rows[0].total_amount});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ══ E-WAY BILL ══
+app.post("/api/ewaybill/generate",auth,async(req,res)=>{
+  try{
+    const{invoice_id,transporter_name,transporter_id,vehicle_no,vehicle_type,distance,supply_type}=req.body;
+    if(!invoice_id)return res.status(400).json({success:false,message:"Invoice required"});
+    const ewb_no=`EWB${Date.now()}`.substring(0,12);
+    const valid_till=new Date(Date.now()+(parseInt(distance||100)/200+1)*24*60*60*1000).toISOString().split("T")[0];
+    res.json({success:true,message:"E-Way Bill generated!",ewb_no,valid_till,transporter_name:transporter_name||"Self",vehicle_no:vehicle_no||"",distance:parseInt(distance)||100});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ══ USER PROFILE UPDATE ══
+app.put("/api/auth/profile",auth,async(req,res)=>{
+  try{const{name,firm_name,frn,phone,gstin}=req.body;await pool.query("UPDATE users SET name=$1,firm_name=$2,frn=$3,phone=$4,gstin=$5 WHERE id=$6",[name,firm_name,frn||null,phone||null,gstin||null,req.user.id]);res.json({success:true,message:"Profile updated"});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 app.listen(PORT,()=>{
   console.log(`\n🚀 TaxPro Complete v4.0 on port ${PORT}`);
   console.log(`🗄️  Database: PostgreSQL`);
