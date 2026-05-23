@@ -799,6 +799,17 @@ app.get("/health",(req,res)=>res.json({success:true,message:"TaxPro Complete v4.
 app.use((req,res)=>res.status(404).json({success:false,message:`Route ${req.method} ${req.url} not found`}));
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({success:false,message:process.env.NODE_ENV==="production"?"Server error":err.message});});
 
+app.listen(PORT,()=>{
+  console.log(`\n🚀 TaxPro Complete v4.0 on port ${PORT}`);
+  console.log(`🗄️  Database: PostgreSQL`);
+  console.log(`\n📌 Routes: Auth | Clients | Notices | Returns | Reconciliation`);
+  console.log(`   Products | Invoices | Parties | Bank | Reports | GSTR-2A`);
+  console.log(`   AI | Challans | Staff | GSTIN`);
+  console.log(`   Accounting: Companies | Groups | Ledgers | Vouchers`);
+  console.log(`   Reports: Trial Balance | P&L | Balance Sheet | Day Book | Cash Book\n`);
+});
+module.exports=app;
+
 // ══ GSTR-1 AUTO-POPULATED ══
 app.get("/api/gstr1/:period",auth,async(req,res)=>{
   try{
@@ -882,14 +893,3 @@ app.post("/api/ewaybill/generate",auth,async(req,res)=>{
 app.put("/api/auth/profile",auth,async(req,res)=>{
   try{const{name,firm_name,frn,phone,gstin}=req.body;await pool.query("UPDATE users SET name=$1,firm_name=$2,frn=$3,phone=$4,gstin=$5 WHERE id=$6",[name,firm_name,frn||null,phone||null,gstin||null,req.user.id]);res.json({success:true,message:"Profile updated"});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
-
-app.listen(PORT,()=>{
-  console.log(`\n🚀 TaxPro Complete v4.0 on port ${PORT}`);
-  console.log(`🗄️  Database: PostgreSQL`);
-  console.log(`\n📌 Routes: Auth | Clients | Notices | Returns | Reconciliation`);
-  console.log(`   Products | Invoices | Parties | Bank | Reports | GSTR-2A`);
-  console.log(`   AI | Challans | Staff | GSTIN`);
-  console.log(`   Accounting: Companies | Groups | Ledgers | Vouchers`);
-  console.log(`   Reports: Trial Balance | P&L | Balance Sheet | Day Book | Cash Book\n`);
-});
-module.exports=app;
