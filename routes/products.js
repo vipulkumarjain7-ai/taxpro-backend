@@ -46,7 +46,7 @@ router.post("/", [
     await pool.query(`
       INSERT INTO products (id,user_id,name,code,hsn_sac,unit,category,gst_rate,purchase_price,sale_price,stock_qty,min_stock,description,is_service)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-    `, [id, req.user.id, name, code||null, hsn_sac||null, unit||"PCS", category||null, gst_rate||18, purchase_price||0, sale_price||0, stock_qty||0, min_stock||0, description||null, is_service||false]);
+    `, [id, req.user.id, name, code||null, hsn_sac||null, unit||"PCS", category||null, gst_rate||18, purchase_price||0, sale_price||0, stock_qty||0, min_stock||0, description||null, is_service === true || is_service === "true"]);
 
     // Record opening stock movement
     if (parseFloat(stock_qty) > 0) {
@@ -70,7 +70,7 @@ router.put("/:id", async (req, res) => {
       UPDATE products SET name=$1,code=$2,hsn_sac=$3,unit=$4,category=$5,gst_rate=$6,
       purchase_price=$7,sale_price=$8,min_stock=$9,description=$10,is_service=$11,updated_at=NOW()
       WHERE id=$12
-    `, [name, code||null, hsn_sac||null, unit||"PCS", category||null, gst_rate||18, purchase_price||0, sale_price||0, min_stock||0, description||null, is_service||false, req.params.id]);
+    `, [name, code||null, hsn_sac||null, unit||"PCS", category||null, gst_rate||18, purchase_price||0, sale_price||0, min_stock||0, description||null, is_service === true || is_service === "true", req.params.id]);
     const updated = await pool.query("SELECT * FROM products WHERE id=$1", [req.params.id]);
     res.json({ success: true, message: "Product updated", product: updated.rows[0] });
   } catch(e) { res.status(500).json({ success: false, message: e.message }); }
