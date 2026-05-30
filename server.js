@@ -42,6 +42,8 @@ const initDB = async () => {
     "ALTER TABLE IF EXISTS invoices ADD COLUMN IF NOT EXISTS cess_amount REAL DEFAULT 0",
     "ALTER TABLE IF EXISTS invoices ADD COLUMN IF NOT EXISTS einvoice_irn TEXT",
     "ALTER TABLE IF EXISTS invoice_items ADD COLUMN IF NOT EXISTS discount_pct REAL DEFAULT 0",
+    // Fix is_service column type from INTEGER to BOOLEAN
+    "ALTER TABLE IF EXISTS products ALTER COLUMN is_service TYPE BOOLEAN USING CASE WHEN is_service=0 THEN FALSE ELSE TRUE END",
   ];
   for (const sql of migrations) {
     try { await pool.query(sql); } catch(e) { /* ignore if table doesn't exist yet */ }
@@ -436,72 +438,10 @@ app.get("/api/products",auth,async(req,res)=>{
   try{const{search}=req.query;let q="SELECT * FROM products WHERE user_id=$1";const p=[req.user.id];if(search){q+=` AND (name ILIKE $${p.length+1} OR code ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}q+=" ORDER BY name ASC";const r=await pool.query(q,p);res.json({success:true,products:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 app.post("/api/products",auth,async(req,res)=>{
-  try{const{name,code,hsn_sac,unit,category,gst_rate,purchase_price,sale_price,stock_qty,min_stock,description,is_service}=req.body;if(!name)return res.status(400).json({success:false,message:"Name required"});const id=uuid();await pool.query("INSERT INTO products (id,user_id,name,code,hsn_sac,unit,category,gst_rate,purchase_price,sale_price,stock_qty,min_stock,description,is_service) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",[id,req.user.id,name,code||null,hsn_sac||null,unit||"PCS",category||null,parseFloat(gst_rate)||18,parseFloat(purchase_price)||0,parseFloat(sale_price)||0,parseFloat(stock_qty)||0,parseFloat(min_stock)||0,description||null,is_service===true||is_service==='true'?true:false]);if(parseFloat(stock_qty)>0)await pool.query("INSERT INTO stock_movements (id,user_id,product_id,type,qty,rate,reference,notes) VALUES ($1,$2,$3,'OPENING',$4,$5,'Opening Stock','Opening stock')",[uuid(),req.user.id,id,parseFloat(stock_qty),parseFloat(purchase_price)||0]);const r=await pool.query("SELECT * FROM products WHERE id=$1",[id]);res.status(201).json({success:true,message:"Product added",product:r.rows[0]});}catch(e){res.status(500).json({success:false,message:e.message});}
+  try{const{name,code,hsn_sac,unit,category,gst_rate,purchase_price,sale_price,stock_qty,min_stock,description,is_service}=req.body;if(!name)return res.status(400).json({success:false,message:"Name required"});const id=uuid();await pool.query("INSERT INTO products (id,user_id,name,code,hsn_sac,unit,category,gst_rate,purchase_price,sale_price,stock_qty,min_stock,description,is_service) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",[id,req.user.id,name,code||null,hsn_sac||null,unit||"PCS",category||null,parseFloat(gst_rate)||18,parseFloat(purchase_price)||0,parseFloat(sale_price)||0,parseFloat(stock_qty)||0,parseFloat(min_stock)||0,description||null,is_service===true||is_service==='true'?1:0]);if(parseFloat(stock_qty)>0)await pool.query("INSERT INTO stock_movements (id,user_id,product_id,type,qty,rate,reference,notes) VALUES ($1,$2,$3,'OPENING',$4,$5,'Opening Stock','Opening stock')",[uuid(),req.user.id,id,parseFloat(stock_qty),parseFloat(purchase_price)||0]);const r=await pool.query("SELECT * FROM products WHERE id=$1",[id]);res.status(201).json({success:true,message:"Product added",product:r.rows[0]});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
-app.put("/api/products/:id", auth, async (req, res) => {
-  try {
-    const {
-      name,
-      code,
-      hsn_sac,
-      unit,
-      category,
-      gst_rate,
-      purchase_price,
-      sale_price,
-      min_stock,
-      description,
-      is_service
-    } = req.body;
-
-    const serviceValue =
-      is_service === true || is_service === "true";
-
-    await pool.query(
-      `UPDATE products 
-       SET 
-        name=$1,
-        code=$2,
-        hsn_sac=$3,
-        unit=$4,
-        category=$5,
-        gst_rate=$6,
-        purchase_price=$7,
-        sale_price=$8,
-        min_stock=$9,
-        description=$10,
-        is_service=$11,
-        updated_at=NOW()
-       WHERE id=$12 AND user_id=$13`,
-      [
-        name,
-        code || null,
-        hsn_sac || null,
-        unit || "PCS",
-        category || null,
-        parseFloat(gst_rate) || 18,
-        parseFloat(purchase_price) || 0,
-        parseFloat(sale_price) || 0,
-        parseFloat(min_stock) || 0,
-        description || null,
-        serviceValue,
-        req.params.id,
-        req.user.id
-      ]
-    );
-
-    res.json({
-      success: true,
-      message: "Updated"
-    });
-
-  } catch (e) {
-    console.log(e);
-    res.status(500).json({
-      success: false,
-      message: e.message
-    });
-  }
+app.put("/api/products/:id",auth,async(req,res)=>{
+  try{const{name,code,hsn_sac,unit,category,gst_rate,purchase_price,sale_price,min_stock,description,is_service}=req.body;await pool.query("UPDATE products SET name=$1,code=$2,hsn_sac=$3,unit=$4,category=$5,gst_rate=$6,purchase_price=$7,sale_price=$8,min_stock=$9,description=$10,is_service=$11,updated_at=NOW() WHERE id=$12 AND user_id=$13",[name,code||null,hsn_sac||null,unit||"PCS",category||null,parseFloat(gst_rate)||18,parseFloat(purchase_price)||0,parseFloat(sale_price)||0,parseFloat(min_stock)||0,description||null,is_service===true||is_service==='true'?1:0,req.params.id,req.user.id]);res.json({success:true,message:"Updated"});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 app.delete("/api/products/:id",auth,async(req,res)=>{
   try{await pool.query("DELETE FROM products WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);res.json({success:true,message:"Deleted"});}catch(e){res.status(500).json({success:false,message:e.message});}
