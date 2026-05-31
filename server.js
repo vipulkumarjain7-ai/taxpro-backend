@@ -798,19 +798,6 @@ app.post("/api/accounting/companies/:cid/godowns",auth,async(req,res)=>{try{cons
 
 // ══ HEALTH ══
 app.get("/health",(req,res)=>res.json({success:true,message:"TaxPro Complete v4.0 - PostgreSQL",db:"PostgreSQL",version:"4.0.0"}));
-app.use((req,res)=>res.status(404).json({success:false,message:`Route ${req.method} ${req.url} not found`}));
-app.use((err,req,res,next)=>{console.error(err);res.status(500).json({success:false,message:process.env.NODE_ENV==="production"?"Server error":err.message});});
-
-app.listen(PORT,()=>{
-  console.log(`\n🚀 TaxPro Complete v4.0 on port ${PORT}`);
-  console.log(`🗄️  Database: PostgreSQL`);
-  console.log(`\n📌 Routes: Auth | Clients | Notices | Returns | Reconciliation`);
-  console.log(`   Products | Invoices | Parties | Bank | Reports | GSTR-2A`);
-  console.log(`   AI | Challans | Staff | GSTIN`);
-  console.log(`   Accounting: Companies | Groups | Ledgers | Vouchers`);
-  console.log(`   Reports: Trial Balance | P&L | Balance Sheet | Day Book | Cash Book\n`);
-});
-module.exports=app;
 
 // ══ GSTR-1 AUTO-POPULATED ══
 app.get("/api/gstr1/:period",auth,async(req,res)=>{
@@ -1095,3 +1082,16 @@ app.delete("/api/hsn/codes",auth,async(req,res)=>{
 app.get("/api/hsn/code/:code",auth,async(req,res)=>{
   try{const r=await pool.query("SELECT * FROM hsn_codes WHERE user_id=$1 AND code=$2 LIMIT 1",[req.user.id,req.params.code]);res.json({success:true,code:r.rows[0]||null});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
+
+app.use((req,res)=>res.status(404).json({success:false,message:`Route ${req.method} ${req.url} not found`}));
+app.use((err,req,res,next)=>{console.error(err);res.status(500).json({success:false,message:process.env.NODE_ENV==="production"?"Server error":err.message});});
+app.listen(PORT,()=>{
+  console.log(`\n🚀 TaxPro Complete v4.0 on port ${PORT}`);
+  console.log(`🗄️  Database: PostgreSQL`);
+  console.log(`\n📌 Routes: Auth | Clients | Notices | Returns | Reconciliation`);
+  console.log(`   Products | Invoices | Parties | Bank | Reports | GSTR-2A`);
+  console.log(`   AI | Challans | Staff | GSTIN`);
+  console.log(`   Accounting: Companies | Groups | Ledgers | Vouchers`);
+  console.log(`   Reports: Trial Balance | P&L | Balance Sheet | Day Book | Cash Book\n`);
+});
+module.exports=app;
