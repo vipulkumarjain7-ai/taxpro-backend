@@ -895,3 +895,203 @@ app.post("/api/ewaybill/generate",auth,async(req,res)=>{
 app.put("/api/auth/profile",auth,async(req,res)=>{
   try{const{name,firm_name,frn,phone,gstin}=req.body;await pool.query("UPDATE users SET name=$1,firm_name=$2,frn=$3,phone=$4,gstin=$5 WHERE id=$6",[name,firm_name,frn||null,phone||null,gstin||null,req.user.id]);res.json({success:true,message:"Profile updated"});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
+
+// ══ ENHANCED GSTIN VALIDATE + LOOKUP ══
+const STATES_MAP_FULL={
+  "01":"Jammu & Kashmir","02":"Himachal Pradesh","03":"Punjab","04":"Chandigarh",
+  "05":"Uttarakhand","06":"Haryana","07":"Delhi","08":"Rajasthan","09":"Uttar Pradesh",
+  "10":"Bihar","11":"Sikkim","12":"Arunachal Pradesh","13":"Nagaland","14":"Manipur",
+  "15":"Mizoram","16":"Tripura","17":"Meghalaya","18":"Assam","19":"West Bengal",
+  "20":"Jharkhand","21":"Odisha","22":"Chhattisgarh","23":"Madhya Pradesh","24":"Gujarat",
+  "25":"Daman & Diu","26":"Dadra & Nagar Haveli","27":"Maharashtra","28":"Andhra Pradesh (Old)",
+  "29":"Karnataka","30":"Goa","31":"Lakshadweep","32":"Kerala","33":"Tamil Nadu",
+  "34":"Puducherry","35":"Andaman & Nicobar","36":"Telangana","37":"Andhra Pradesh",
+  "38":"Ladakh","97":"Other Territory","99":"Centre Jurisdiction"
+};
+
+function validateGSTINFormat(gstin){
+  return /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/.test(gstin);
+}
+
+function validateGSTINChecksum(gstin){
+  try{
+    const chars="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let sum=0;
+    for(let i=0;i<14;i++){
+      const idx=chars.indexOf(gstin[i]);
+      if(idx===-1)return false;
+      const val=i%2===0?idx:(idx*2);
+      sum+=Math.floor(val/36)+(val%36);
+    }
+    const expected=chars[(36-(sum%36))%36];
+    return expected===gstin[14];
+  }catch(e){return false;}
+}
+
+app.get("/api/gstin/lookup/:gstin",auth,async(req,res)=>{
+  try{
+    const gstin=req.params.gstin.toUpperCase().trim();
+    // Step 1: Format validation
+    if(!validateGSTINFormat(gstin)){
+      return res.json({success:false,valid:false,message:"Invalid GSTIN format. Must be 15 characters: 2 digits + 5 letters + 4 digits + 1 letter + 1 alphanumeric + Z + 1 alphanumeric"});
+    }
+    // Step 2: Checksum validation
+    if(!validateGSTINChecksum(gstin)){
+      return res.json({success:false,valid:false,message:"Invalid GSTIN — checksum failed. Please check the last character."});
+    }
+    // Step 3: Extract info from GSTIN
+    const stateCode=gstin.substring(0,2);
+    const pan=gstin.substring(2,12);
+    const state=STATES_MAP_FULL[stateCode]||"Unknown State";
+    const entityType=gstin[12];
+    const entityMap={"1":"Proprietorship","2":"Partnership","3":"HUF","4":"Company","5":"Trust","6":"Government","7":"LLP","9":"PEO"};
+    const entity=entityMap[entityType]||"Business";
+
+    // Step 4: Try to fetch from GST public API
+    let businessName="",address="",pincode="",city="";
+    try{
+      const controller=new AbortController();
+      const timeout=setTimeout(()=>controller.abort(),5000);
+      const apiRes=await fetch(`https://api.gst.gov.in/commonapi/v1.1/search?action=TP&gstin=${gstin}`,{
+        signal:controller.signal,
+        headers:{"Accept":"application/json","Content-Type":"application/json"}
+      });
+      clearTimeout(timeout);
+      if(apiRes.ok){
+        const apiData=await apiRes.json();
+        if(apiData?.taxpayerInfo){
+          businessName=apiData.taxpayerInfo.lgnm||apiData.taxpayerInfo.tradeNam||"";
+          const adr=apiData.taxpayerInfo.pradr?.addr;
+          if(adr){
+            address=[adr.bno,adr.st,adr.loc].filter(Boolean).join(", ");
+            city=adr.dst||adr.loc||"";
+            pincode=adr.pncd||"";
+          }
+        }
+      }
+    }catch(e){/* API unavailable, return format-validated data */}
+
+    res.json({
+      success:true,
+      valid:true,
+      gstin,
+      state_code:stateCode,
+      state,
+      pan,
+      entity_type:entity,
+      business_name:businessName,
+      address,
+      city,
+      pincode,
+      message:businessName?`✅ Valid GSTIN — ${businessName}`:`✅ Valid GSTIN — ${state} (${entity})`
+    });
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ══ HSN CODES TABLE (added in initDB via migration) ══
+// Run this once to create the table
+pool.query(`
+  CREATE TABLE IF NOT EXISTS hsn_codes (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    code TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    gst_rate REAL DEFAULT 0,
+    uom TEXT DEFAULT 'NOS',
+    chapter TEXT DEFAULT '',
+    is_service BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )
+`).catch(()=>{});
+
+pool.query(`CREATE INDEX IF NOT EXISTS idx_hsn_code ON hsn_codes(code)`).catch(()=>{});
+pool.query(`CREATE INDEX IF NOT EXISTS idx_hsn_user ON hsn_codes(user_id)`).catch(()=>{});
+
+// ══ HSN: SEARCH (autocomplete) ══
+app.get("/api/hsn/search",auth,async(req,res)=>{
+  try{
+    const{q="",limit=10}=req.query;
+    if(!q||q.length<2)return res.json({success:true,codes:[]});
+    const r=await pool.query(
+      `SELECT DISTINCT ON (code) code,description,gst_rate,uom,is_service
+       FROM hsn_codes
+       WHERE user_id=$1 AND (code ILIKE $2 OR description ILIKE $3)
+       ORDER BY code ASC LIMIT $4`,
+      [req.user.id,`${q}%`,`%${q}%`,parseInt(limit)||10]
+    );
+    res.json({success:true,codes:r.rows});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ══ HSN: GET ALL (paginated) ══
+app.get("/api/hsn/codes",auth,async(req,res)=>{
+  try{
+    const{page=1,limit=50,search=""}=req.query;
+    const offset=(parseInt(page)-1)*parseInt(limit);
+    let q="SELECT * FROM hsn_codes WHERE user_id=$1";
+    const p=[req.user.id];
+    if(search){q+=` AND (code ILIKE $${p.length+1} OR description ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}
+    q+=` ORDER BY code ASC LIMIT $${p.length+1} OFFSET $${p.length+2}`;
+    p.push(parseInt(limit),offset);
+    const r=await pool.query(q,p);
+    const count=await pool.query(`SELECT COUNT(*) as c FROM hsn_codes WHERE user_id=$1${search?` AND (code ILIKE '%${search}%' OR description ILIKE '%${search}%')`:""}`, [req.user.id]);
+    res.json({success:true,codes:r.rows,total:parseInt(count.rows[0].c),page:parseInt(page),limit:parseInt(limit)});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ══ HSN: UPLOAD EXCEL/CSV ══
+app.post("/api/hsn/upload",upload.single("file"),auth,async(req,res)=>{
+  try{
+    if(!req.file)return res.status(400).json({success:false,message:"File required"});
+    const wb=XLSX.read(req.file.buffer,{type:"buffer"});
+    const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:""});
+    if(!rows.length)return res.status(400).json({success:false,message:"No data found in file"});
+
+    // Auto-detect column names (handles various Excel formats)
+    const sample=rows[0];
+    const keys=Object.keys(sample).map(k=>k.toLowerCase().trim());
+    const findKey=(options)=>Object.keys(sample).find(k=>options.includes(k.toLowerCase().trim()))||null;
+
+    const codeKey  =findKey(["hsn code","hsn","code","hsn/sac","sac code","hsncode","hsnsac"]);
+    const descKey  =findKey(["description","desc","item description","goods description","commodity","name","product","item","hsn description"]);
+    const gstKey   =findKey(["gst rate","gst","rate","tax rate","gst%","rate%","cgst+sgst","igst","tax","gstrate"]);
+    const uomKey   =findKey(["uom","unit","unit of measure","uqc","unit of measurement"]);
+
+    if(!codeKey)return res.status(400).json({success:false,message:`HSN Code column not found. Found columns: ${Object.keys(sample).join(", ")}`});
+
+    let imported=0,skipped=0,updated=0;
+    const uid=req.user.id;
+
+    for(const row of rows){
+      const code=String(row[codeKey]||"").trim().replace(/[^0-9]/g,"");
+      if(!code||code.length<2){skipped++;continue;}
+      const desc=descKey?String(row[descKey]||"").trim():"";
+      const gstRaw=gstKey?String(row[gstKey]||"0").replace(/[^0-9.]/g,""):"0";
+      const gst=parseFloat(gstRaw)||0;
+      const uom=uomKey?String(row[uomKey]||"NOS").trim().toUpperCase():"NOS";
+      const chapter=code.substring(0,2);
+      const isSvc=gstKey&&String(row[gstKey]||"").toLowerCase().includes("service")?true:false;
+
+      const existing=await pool.query("SELECT id FROM hsn_codes WHERE user_id=$1 AND code=$2",[uid,code]);
+      if(existing.rows[0]){
+        await pool.query("UPDATE hsn_codes SET description=$1,gst_rate=$2,uom=$3,chapter=$4 WHERE id=$5",[desc||existing.rows[0].description,gst,uom,chapter,existing.rows[0].id]);
+        updated++;
+      }else{
+        await pool.query("INSERT INTO hsn_codes (id,user_id,code,description,gst_rate,uom,chapter,is_service) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",[uuid(),uid,code,desc,gst,uom,chapter,isSvc]);
+        imported++;
+      }
+    }
+
+    res.json({success:true,message:`✅ Done! ${imported} new HSN codes imported, ${updated} updated, ${skipped} skipped`,imported,updated,skipped,total:rows.length});
+  }catch(e){res.status(500).json({success:false,message:"Upload failed: "+e.message});}
+});
+
+// ══ HSN: DELETE ALL ══
+app.delete("/api/hsn/codes",auth,async(req,res)=>{
+  try{await pool.query("DELETE FROM hsn_codes WHERE user_id=$1",[req.user.id]);res.json({success:true,message:"All HSN codes deleted"});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ══ HSN: GET SINGLE ══
+app.get("/api/hsn/code/:code",auth,async(req,res)=>{
+  try{const r=await pool.query("SELECT * FROM hsn_codes WHERE user_id=$1 AND code=$2 LIMIT 1",[req.user.id,req.params.code]);res.json({success:true,code:r.rows[0]||null});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
