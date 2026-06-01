@@ -1089,6 +1089,117 @@ app.get("/api/hsn/code/:code",auth,async(req,res)=>{
   try{const r=await pool.query("SELECT * FROM hsn_codes WHERE user_id=$1 AND code=$2 LIMIT 1",[req.user.id,req.params.code]);res.json({success:true,code:r.rows[0]||null});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+// ══ DATA BACKUP ══
+app.get("/api/backup/export", auth, async(req,res)=>{
+  try{
+    const uid = req.user.id;
+    const user = await pool.query("SELECT id,name,email,firm_name,frn,role FROM users WHERE id=$1",[uid]);
+
+    // Fetch all data in parallel
+    const [
+      clients, invoices, invoice_items, payments,
+      products, stock_movements,
+      notices, returns, reconciliation, challans,
+      bank_txns, bank_imports,
+      companies, groups, ledgers, vouchers, voucher_items,
+      hsn_codes
+    ] = await Promise.all([
+      pool.query("SELECT * FROM clients WHERE user_id=$1",[uid]),
+      pool.query("SELECT * FROM invoices WHERE user_id=$1",[uid]),
+      pool.query("SELECT ii.* FROM invoice_items ii JOIN invoices i ON ii.invoice_id=i.id WHERE i.user_id=$1",[uid]),
+      pool.query("SELECT * FROM payments WHERE user_id=$1",[uid]),
+      pool.query("SELECT * FROM products WHERE user_id=$1",[uid]),
+      pool.query("SELECT * FROM stock_movements WHERE user_id=$1",[uid]),
+      pool.query("SELECT * FROM notices WHERE user_id=$1",[uid]),
+      pool.query("SELECT * FROM returns WHERE user_id=$1",[uid]),
+      pool.query("SELECT * FROM reconciliation WHERE user_id=$1",[uid]),
+      pool.query("SELECT * FROM challans WHERE user_id=$1",[uid]),
+      pool.query("SELECT * FROM bank_transactions WHERE user_id=$1",[uid]),
+      pool.query("SELECT * FROM bank_imports WHERE user_id=$1",[uid]),
+      pool.query("SELECT * FROM companies WHERE user_id=$1",[uid]),
+      pool.query("SELECT * FROM ledger_groups WHERE user_id=$1",[uid]),
+      pool.query("SELECT * FROM ledgers WHERE user_id=$1",[uid]),
+      pool.query("SELECT * FROM vouchers WHERE user_id=$1",[uid]),
+      pool.query("SELECT vi.* FROM voucher_items vi JOIN vouchers v ON vi.voucher_id=v.id WHERE v.user_id=$1",[uid]),
+      pool.query("SELECT * FROM hsn_codes WHERE user_id=$1",[uid]),
+    ]);
+
+    const backup = {
+      backup_version: "2.0",
+      app: "TaxPro GST v4.0",
+      exported_at: new Date().toISOString(),
+      exported_by: user.rows[0]?.email,
+      firm_name: user.rows[0]?.firm_name,
+      data: {
+        clients: clients.rows,
+        invoices: invoices.rows,
+        invoice_items: invoice_items.rows,
+        payments: payments.rows,
+        products: products.rows,
+        stock_movements: stock_movements.rows,
+        notices: notices.rows,
+        returns: returns.rows,
+        reconciliation: reconciliation.rows,
+        challans: challans.rows,
+        bank_transactions: bank_txns.rows,
+        bank_imports: bank_imports.rows,
+        accounting: {
+          companies: companies.rows,
+          ledger_groups: groups.rows,
+          ledgers: ledgers.rows,
+          vouchers: vouchers.rows,
+          voucher_items: voucher_items.rows,
+        },
+        hsn_codes: hsn_codes.rows,
+      },
+      stats: {
+        clients: clients.rows.length,
+        invoices: invoices.rows.length,
+        products: products.rows.length,
+        vouchers: vouchers.rows.length,
+        bank_transactions: bank_txns.rows.length,
+        hsn_codes: hsn_codes.rows.length,
+        total_records: clients.rows.length + invoices.rows.length + products.rows.length + vouchers.rows.length,
+      }
+    };
+
+    const json = JSON.stringify(backup, null, 2);
+    const filename = `taxpro_backup_${user.rows[0]?.firm_name?.replace(/[^a-zA-Z0-9]/g,"_")}_${new Date().toISOString().split("T")[0]}.json`;
+
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.send(json);
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// Backup stats (how much data)
+app.get("/api/backup/stats", auth, async(req,res)=>{
+  try{
+    const uid=req.user.id;
+    const tables=["clients","invoices","products","notices","returns","reconciliation","bank_transactions","vouchers","hsn_codes","payments","challans"];
+    const stats={};
+    for(const t of tables){
+      try{
+        const r=await pool.query(`SELECT COUNT(*) as c FROM ${t} WHERE user_id=$1`,[uid]);
+        stats[t]=parseInt(r.rows[0].c);
+      }catch(e){stats[t]=0;}
+    }
+    const total=Object.values(stats).reduce((a,v)=>a+v,0);
+    const lastInvoice=await pool.query("SELECT created_at FROM invoices WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1",[uid]);
+    res.json({success:true,stats,total_records:total,last_invoice:lastInvoice.rows[0]?.created_at||null});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// Restore from backup (selective)
+app.post("/api/backup/restore-check", auth, async(req,res)=>{
+  try{
+    const{backup}=req.body;
+    if(!backup?.data)return res.status(400).json({success:false,message:"Invalid backup file"});
+    if(backup.backup_version!=="2.0")return res.status(400).json({success:false,message:"Incompatible backup version"});
+    res.json({success:true,message:"Backup file is valid",stats:backup.stats,exported_at:backup.exported_at,firm:backup.firm_name});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 app.use((req,res)=>res.status(404).json({success:false,message:`Route ${req.method} ${req.url} not found`}));
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({success:false,message:process.env.NODE_ENV==="production"?"Server error":err.message});});
 app.listen(PORT,()=>{
