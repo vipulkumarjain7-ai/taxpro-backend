@@ -204,13 +204,19 @@ app.use(cors({ origin:"*", methods:["GET","POST","PUT","PATCH","DELETE","OPTIONS
 app.use(morgan("combined"));
 app.use(express.json({ limit:"10mb" }));
 app.use(express.urlencoded({ extended:true }));
-const upload = multer({ storage:multer.memoryStorage(), limits:{ fileSize:20*1024*1024 } });
+const upload = multer({ storage:multer.memoryStorage(), limits:{ fileSize:50*1024*1024 } });
 
 const auth = (req, res, next) => {
   const h = req.headers.authorization;
-  if (!h?.startsWith("Bearer ")) return res.status(401).json({ success:false, message:"No token provided" });
-  try { req.user = jwt.verify(h.split(" ")[1], JWT); next(); }
-  catch(e) { return res.status(401).json({ success:false, message:"Invalid or expired token" }); }
+  if (!h) return res.status(401).json({ success:false, message:"No token. Please login." });
+  if (!h.startsWith("Bearer ")) return res.status(401).json({ success:false, message:"Invalid token format. Please login." });
+  const token = h.split(" ")[1];
+  if (!token || token === "null" || token === "undefined") return res.status(401).json({ success:false, message:"Empty token. Please login again." });
+  try { req.user = jwt.verify(token, JWT); next(); }
+  catch(e) {
+    if (e.name === "TokenExpiredError") return res.status(401).json({ success:false, message:"Session expired. Please logout and login again." });
+    return res.status(401).json({ success:false, message:"Invalid token. Please logout and login again." });
+  }
 };
 
 const callGroq = (messages, system) => new Promise((resolve) => {
@@ -542,7 +548,7 @@ const guessCategory=d=>{const t=(d||"").toLowerCase();if(t.includes("salary")||t
 const guessType=(d,isDebit)=>{const t=(d||"").toLowerCase();if(t.includes("gst")||t.includes("tds")||t.includes("tax"))return"TAX";if(t.includes("neft")||t.includes("rtgs")||t.includes("imps")||t.includes("transfer"))return"TRANSFER";if(t.includes("emi")||t.includes("loan")||t.includes("charges")||t.includes("fee"))return"BANK";if(!isDebit)return"INCOME";if(t.includes("salary")||t.includes("rent")||t.includes("vendor"))return"EXPENSE";if(t.includes("purchase")||t.includes("supplier"))return"PURCHASE";return isDebit?"EXPENSE":"INCOME";};
 const parseTransactions=text=>{const lines=text.split("\n").map(l=>l.trim()).filter(l=>l.length>5);const txns=[];const dReg=/(\d{2}[\/\-]\d{2}[\/\-]\d{4}|\d{2}[\/\-]\d{2}[\/\-]\d{2})/;for(const line of lines){const dm=line.match(dReg);if(!dm)continue;const ds=dm[1];const ars=[];let m;const ar=/(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)/g;while((m=ar.exec(line))!==null){const v=parseFloat(m[1].replace(/,/g,""));if(v>0)ars.push(v);}if(ars.length<2)continue;let desc=line.replace(ds,"").replace(/\d{1,3}(?:,\d{3})*(?:\.\d{2})?/g,"").replace(/\s+/g," ").trim();if(!desc||desc.length<3)continue;const isDebit=line.toLowerCase().includes("dr")||line.toLowerCase().includes("debit");const debit=isDebit?ars[ars.length-3]||ars[0]||0:0;const credit=!isDebit?ars[ars.length-2]||ars[0]||0:0;const normDate=ds.replace(/(\d{2})[\/\-](\d{2})[\/\-](\d{2,4})/,(_,d,mo,y)=>`${y.length===2?"20"+y:y}-${mo}-${d}`);txns.push({txn_date:normDate,description:desc.substring(0,200),debit,credit,balance:ars[ars.length-1]||0,category:guessCategory(desc),type:guessType(desc,isDebit)});}return txns;};
 
-app.post("/api/bank/upload",upload.single("file"),auth,async(req,res)=>{
+app.post("/api/bank/upload",auth,upload.single("file"),async(req,res)=>{
   try{if(!req.file)return res.status(400).json({success:false,message:"PDF required"});let text="";try{const pp=require("pdf-parse");const data=await pp(req.file.buffer);text=data.text;}catch(e){return res.status(400).json({success:false,message:"Cannot read PDF. Use digital (not scanned) PDF."});}if(!text||text.length<50)return res.status(400).json({success:false,message:"No text found in PDF."});const transactions=parseTransactions(text);if(transactions.length===0)return res.status(400).json({success:false,message:"No transactions found."});const td=transactions.reduce((a,t)=>a+(t.debit||0),0),tc=transactions.reduce((a,t)=>a+(t.credit||0),0);res.json({success:true,message:`Found ${transactions.length} transactions`,preview:{bank_name:req.body.bank_name||"Unknown Bank",account_no:req.body.account_no||"",total_txns:transactions.length,total_debit:td,total_credit:tc,transactions}});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 app.post("/api/bank/import",auth,async(req,res)=>{
@@ -572,15 +578,15 @@ app.post("/api/challans",auth,async(req,res)=>{try{const{client_id,challan_no,ty
 app.delete("/api/challans/:id",auth,async(req,res)=>{try{await pool.query("DELETE FROM challans WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);res.json({success:true,message:"Deleted"});}catch(e){res.status(500).json({success:false,message:e.message});}});
 
 // ══ IMPORT EXCEL ══
-app.post("/api/import/clients",upload.single("file"),auth,async(req,res)=>{
+app.post("/api/import/clients",auth,upload.single("file"),async(req,res)=>{
   try{const wb=XLSX.read(req.file.buffer,{type:"buffer"});const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);let imported=0,skipped=0;for(const row of rows){const gstin=(row["GSTIN"]||row["gstin"]||"").toString().trim().toUpperCase();const name=(row["Name"]||row["name"]||row["Trade Name"]||"").toString().trim();if(!gstin||!name){skipped++;continue;}const ex=await pool.query("SELECT id FROM clients WHERE user_id=$1 AND gstin=$2",[req.user.id,gstin]);if(ex.rows[0]){skipped++;continue;}await pool.query("INSERT INTO clients (id,user_id,name,gstin,state,type,status) VALUES ($1,$2,$3,$4,$5,$6,'compliant')",[uuid(),req.user.id,name,gstin,(row["State"]||row["state"]||"").toString().trim(),(row["Type"]||row["type"]||"Trader").toString().trim()]);imported++;}res.json({success:true,message:`${imported} imported, ${skipped} skipped`});}catch(e){res.status(500).json({success:false,message:"Import failed: "+e.message});}
 });
 
 // ══ GSTR-2A ══
-app.post("/api/gstr2a/preview",upload.single("file"),auth,async(req,res)=>{
+app.post("/api/gstr2a/preview",auth,upload.single("file"),async(req,res)=>{
   try{const wb=XLSX.read(req.file.buffer,{type:"buffer"});const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:""});const grouped={};for(const row of rows){const gstin=(row["GSTIN of Supplier"]||row["GSTIN"]||row["gstin"]||row["ctin"]||"").toString().trim().toUpperCase();if(!gstin||gstin.length<15)continue;const name=(row["Trade/Legal name of the Supplier"]||row["Trade Name"]||row["trdnm"]||"").toString().trim();const itc=(parseFloat(row["Integrated Tax Amount"]||row["iamt"]||0)||0)+(parseFloat(row["Central Tax Amount"]||row["camt"]||0)||0)+(parseFloat(row["State/UT Tax Amount"]||row["samt"]||0)||0);if(!grouped[gstin])grouped[gstin]={gstin,name,invoices:0,igst:parseFloat(row["Integrated Tax Amount"]||0)||0,cgst:parseFloat(row["Central Tax Amount"]||0)||0,sgst:parseFloat(row["State/UT Tax Amount"]||0)||0,itc:0};grouped[gstin].invoices++;grouped[gstin].itc+=itc;}const suppliers=Object.values(grouped);res.json({success:true,preview:{total_invoices:rows.length,total_suppliers:suppliers.length,total_itc:suppliers.reduce((a,s)=>a+s.itc,0),suppliers}});}catch(e){res.status(500).json({success:false,message:"Preview failed: "+e.message});}
 });
-app.post("/api/gstr2a/import",upload.single("file"),auth,async(req,res)=>{
+app.post("/api/gstr2a/import",auth,upload.single("file"),async(req,res)=>{
   try{const{client_id,period}=req.body;const wb=XLSX.read(req.file.buffer,{type:"buffer"});const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:""});const grouped={};for(const row of rows){const gstin=(row["GSTIN of Supplier"]||row["GSTIN"]||row["gstin"]||row["ctin"]||"").toString().trim().toUpperCase();if(!gstin||gstin.length<15)continue;const name=(row["Trade/Legal name of the Supplier"]||row["Trade Name"]||row["trdnm"]||"").toString().trim();const itc=(parseFloat(row["Integrated Tax Amount"]||row["iamt"]||0)||0)+(parseFloat(row["Central Tax Amount"]||row["camt"]||0)||0)+(parseFloat(row["State/UT Tax Amount"]||row["samt"]||0)||0);if(!grouped[gstin])grouped[gstin]={gstin,name,count:0,itc:0};grouped[gstin].count++;grouped[gstin].itc+=itc;}let saved=0;for(const s of Object.values(grouped)){await pool.query("INSERT INTO reconciliation (id,user_id,client_id,period,vendor_name,vendor_gstin,invoice_count,gstr2a_amount,gstr2b_amount,books_amount,difference,status,remarks) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,'mismatch','Imported from GSTR-2A') ON CONFLICT DO NOTHING",[uuid(),req.user.id,client_id,period,s.name,s.gstin,s.count,s.itc,s.itc,s.itc]);saved++;}res.json({success:true,message:`${saved} suppliers imported!`,summary:{total_invoices:rows.length,saved,total_itc:Object.values(grouped).reduce((a,s)=>a+s.itc,0)}});}catch(e){res.status(500).json({success:false,message:"Import failed: "+e.message});}
 });
 
@@ -1027,7 +1033,7 @@ app.get("/api/hsn/codes",auth,async(req,res)=>{
 });
 
 // ══ HSN: UPLOAD EXCEL/CSV ══
-app.post("/api/hsn/upload",upload.single("file"),auth,async(req,res)=>{
+app.post("/api/hsn/upload",auth,upload.single("file"),async(req,res)=>{
   try{
     if(!req.file)return res.status(400).json({success:false,message:"File required"});
     const wb=XLSX.read(req.file.buffer,{type:"buffer"});
