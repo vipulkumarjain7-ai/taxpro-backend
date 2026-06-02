@@ -14,9 +14,20 @@ const app  = express();
 const PORT = process.env.PORT || 5000;
 const JWT  = process.env.JWT_SECRET || "taxpro_secret_2024";
 
+// Auto-detect SSL for Neon, Supabase, or any cloud PostgreSQL
+const sslConfig = process.env.DATABASE_URL?.includes("neon.tech") ||
+                  process.env.DATABASE_URL?.includes("supabase.co") ||
+                  process.env.DATABASE_URL?.includes("sslmode=require") ||
+                  process.env.NODE_ENV === "production"
+                  ? { rejectUnauthorized: false } : false;
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
+  ssl: sslConfig,
+  // Connection pool settings for serverless (Neon)
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
 });
 
 pool.connect((err, client, release) => {
