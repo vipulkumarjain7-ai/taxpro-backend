@@ -55,6 +55,21 @@ const initDB = async () => {
     "ALTER TABLE IF EXISTS invoice_items ADD COLUMN IF NOT EXISTS discount_pct REAL DEFAULT 0",
     // Fix is_service column type from INTEGER to BOOLEAN
     "ALTER TABLE IF EXISTS products ALTER COLUMN is_service TYPE BOOLEAN USING CASE WHEN is_service=0 THEN FALSE ELSE TRUE END",
+    // Company isolation columns
+    "ALTER TABLE IF EXISTS invoices ADD COLUMN IF NOT EXISTS company_id TEXT",
+    "ALTER TABLE IF EXISTS parties ADD COLUMN IF NOT EXISTS company_id TEXT",
+    "ALTER TABLE IF EXISTS products ADD COLUMN IF NOT EXISTS company_id TEXT",
+    "ALTER TABLE IF EXISTS bank_transactions ADD COLUMN IF NOT EXISTS company_id TEXT",
+    "ALTER TABLE IF EXISTS bank_imports ADD COLUMN IF NOT EXISTS company_id TEXT",
+    "ALTER TABLE IF EXISTS payments ADD COLUMN IF NOT EXISTS company_id TEXT",
+    "ALTER TABLE IF EXISTS notices ADD COLUMN IF NOT EXISTS company_id TEXT",
+    "ALTER TABLE IF EXISTS returns ADD COLUMN IF NOT EXISTS company_id TEXT",
+    "ALTER TABLE IF EXISTS reconciliation ADD COLUMN IF NOT EXISTS company_id TEXT",
+    "ALTER TABLE IF EXISTS challans ADD COLUMN IF NOT EXISTS company_id TEXT",
+    "ALTER TABLE IF EXISTS stock_movements ADD COLUMN IF NOT EXISTS company_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_invoices_company ON invoices(company_id)",
+    "CREATE INDEX IF NOT EXISTS idx_parties_company ON parties(company_id)",
+    "CREATE INDEX IF NOT EXISTS idx_products_company ON products(company_id)",
   ];
   for (const sql of migrations) {
     try { await pool.query(sql); } catch(e) { /* ignore if table doesn't exist yet */ }
@@ -452,7 +467,7 @@ app.delete("/api/reconciliation/:id",auth,async(req,res)=>{
 
 // ══ PRODUCTS ══
 app.get("/api/products",auth,async(req,res)=>{
-  try{const{search}=req.query;let q="SELECT * FROM products WHERE user_id=$1";const p=[req.user.id];if(search){q+=` AND (name ILIKE $${p.length+1} OR code ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}q+=" ORDER BY name ASC";const r=await pool.query(q,p);res.json({success:true,products:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
+  try{const{search,company_id}=req.query;let q="SELECT * FROM products WHERE user_id=$1";const p=[req.user.id];if(company_id){q+=` AND (company_id=$${p.length+1} OR company_id IS NULL)`;p.push(company_id);}if(search){q+=` AND (name ILIKE $${p.length+1} OR code ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}q+=" ORDER BY name ASC";const r=await pool.query(q,p);res.json({success:true,products:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 app.post("/api/products",auth,async(req,res)=>{
   try{const{name,code,hsn_sac,unit,category,gst_rate,purchase_price,sale_price,stock_qty,min_stock,description,is_service}=req.body;if(!name)return res.status(400).json({success:false,message:"Name required"});const id=uuid();await pool.query("INSERT INTO products (id,user_id,name,code,hsn_sac,unit,category,gst_rate,purchase_price,sale_price,stock_qty,min_stock,description,is_service) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",[id,req.user.id,name,code||null,hsn_sac||null,unit||"PCS",category||null,parseFloat(gst_rate)||18,parseFloat(purchase_price)||0,parseFloat(sale_price)||0,parseFloat(stock_qty)||0,parseFloat(min_stock)||0,description||null,is_service===true||is_service==='true'?1:0]);if(parseFloat(stock_qty)>0)await pool.query("INSERT INTO stock_movements (id,user_id,product_id,type,qty,rate,reference,notes) VALUES ($1,$2,$3,'OPENING',$4,$5,'Opening Stock','Opening stock')",[uuid(),req.user.id,id,parseFloat(stock_qty),parseFloat(purchase_price)||0]);const r=await pool.query("SELECT * FROM products WHERE id=$1",[id]);res.status(201).json({success:true,message:"Product added",product:r.rows[0]});}catch(e){res.status(500).json({success:false,message:e.message});}
@@ -519,7 +534,7 @@ app.delete("/api/invoices/:id",auth,async(req,res)=>{
 
 // ══ PARTIES ══
 app.get("/api/parties",auth,async(req,res)=>{
-  try{const{search}=req.query;let q="SELECT c.*,COALESCE((SELECT SUM(balance_due) FROM invoices WHERE party_id=c.id AND status IN ('unpaid','partial')),0) as outstanding FROM clients c WHERE c.user_id=$1";const p=[req.user.id];if(search){q+=` AND (c.name ILIKE $${p.length+1} OR c.gstin ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}q+=" ORDER BY c.name ASC";const r=await pool.query(q,p);res.json({success:true,parties:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
+  try{const{search,company_id}=req.query;let q="SELECT c.*,COALESCE((SELECT SUM(balance_due) FROM invoices WHERE party_id=c.id AND status IN ('unpaid','partial')),0) as outstanding FROM clients c WHERE c.user_id=$1";const p=[req.user.id];if(company_id){q+=` AND (c.company_id=$${p.length+1} OR c.company_id IS NULL)`;p.push(company_id);}if(search){q+=` AND (c.name ILIKE $${p.length+1} OR c.gstin ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}q+=" ORDER BY c.name ASC";const r=await pool.query(q,p);res.json({success:true,parties:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 app.post("/api/parties",auth,async(req,res)=>{
   try{const{name,gstin,state,type,phone,email,address,city,pincode,pan,credit_limit}=req.body;if(!name)return res.status(400).json({success:false,message:"Name required"});const id=uuid();await pool.query("INSERT INTO clients (id,user_id,name,gstin,state,type,phone,email,address,city,pincode,pan,credit_limit) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",[id,req.user.id,name,gstin||null,state||null,type||"Customer",phone||null,email||null,address||null,city||null,pincode||null,pan||null,parseFloat(credit_limit)||0]);const r=await pool.query("SELECT * FROM clients WHERE id=$1",[id]);res.status(201).json({success:true,message:"Party added",party:r.rows[0]});}catch(e){res.status(500).json({success:false,message:e.message});}
@@ -1100,91 +1115,6 @@ app.get("/api/hsn/code/:code",auth,async(req,res)=>{
   try{const r=await pool.query("SELECT * FROM hsn_codes WHERE user_id=$1 AND code=$2 LIMIT 1",[req.user.id,req.params.code]);res.json({success:true,code:r.rows[0]||null});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-// ══ FULL DATA RESTORE ══
-app.post("/api/backup/restore", auth, async(req,res)=>{
-  try{
-    const{backup}=req.body;
-    if(!backup?.data)return res.status(400).json({success:false,message:"Invalid backup"});
-    const uid=req.user.id;
-    const d=backup.data;
-    let restored={clients:0,invoices:0,invoice_items:0,products:0,notices:0,returns:0,reconciliation:0,payments:0,bank_transactions:0,hsn_codes:0,companies:0,ledger_groups:0,ledgers:0,vouchers:0,voucher_items:0};
-
-    // Restore clients
-    for(const r of d.clients||[]){
-      try{await pool.query(`INSERT INTO clients (id,user_id,name,gstin,state,type,turnover,notes,status,phone,email,address,city,pincode,pan,credit_limit,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,gstin=EXCLUDED.gstin`,
-        [r.id,uid,r.name,r.gstin||null,r.state||null,r.type||"Trader",r.turnover||null,r.notes||null,r.status||"compliant",r.phone||null,r.email||null,r.address||null,r.city||null,r.pincode||null,r.pan||null,r.credit_limit||0,r.created_at||new Date()]);restored.clients++;}catch(e){}
-    }
-    // Restore products
-    for(const r of d.products||[]){
-      try{await pool.query(`INSERT INTO products (id,user_id,name,code,hsn_sac,unit,category,gst_rate,purchase_price,sale_price,stock_qty,min_stock,description,is_service,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name`,
-        [r.id,uid,r.name,r.code||null,r.hsn_sac||null,r.unit||"PCS",r.category||null,r.gst_rate||18,r.purchase_price||0,r.sale_price||0,r.stock_qty||0,r.min_stock||0,r.description||null,r.is_service||false,r.created_at||new Date()]);restored.products++;}catch(e){}
-    }
-    // Restore invoices
-    for(const r of d.invoices||[]){
-      try{await pool.query(`INSERT INTO invoices (id,user_id,invoice_no,invoice_type,party_id,party_name,party_gstin,party_address,party_state,invoice_date,due_date,place_of_supply,is_igst,subtotal,taxable_amount,igst_amount,cgst_amount,sgst_amount,total_tax,total_amount,paid_amount,balance_due,status,notes,terms,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26) ON CONFLICT (id) DO NOTHING`,
-        [r.id,uid,r.invoice_no,r.invoice_type||"SALES",r.party_id||null,r.party_name,r.party_gstin||null,r.party_address||null,r.party_state||null,r.invoice_date,r.due_date||null,r.place_of_supply||null,r.is_igst||false,r.subtotal||0,r.taxable_amount||0,r.igst_amount||0,r.cgst_amount||0,r.sgst_amount||0,r.total_tax||0,r.total_amount||0,r.paid_amount||0,r.balance_due||0,r.status||"unpaid",r.notes||null,r.terms||null,r.created_at||new Date()]);restored.invoices++;}catch(e){}
-    }
-    // Restore invoice items
-    for(const r of d.invoice_items||[]){
-      try{await pool.query(`INSERT INTO invoice_items (id,invoice_id,product_id,name,hsn_sac,unit,qty,rate,discount_pct,taxable_value,gst_rate,igst_amount,cgst_amount,sgst_amount,total_amount) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT (id) DO NOTHING`,
-        [r.id,r.invoice_id,r.product_id||null,r.name,r.hsn_sac||null,r.unit||"PCS",r.qty||0,r.rate||0,r.discount_pct||0,r.taxable_value||0,r.gst_rate||0,r.igst_amount||0,r.cgst_amount||0,r.sgst_amount||0,r.total_amount||0]);restored.invoice_items++;}catch(e){}
-    }
-    // Restore payments
-    for(const r of d.payments||[]){
-      try{await pool.query(`INSERT INTO payments (id,user_id,invoice_id,party_name,type,amount,method,reference_no,payment_date) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO NOTHING`,
-        [r.id,uid,r.invoice_id,r.party_name,r.type||"RECEIVED",r.amount||0,r.method||"CASH",r.reference_no||null,r.payment_date]);restored.payments++;}catch(e){}
-    }
-    // Restore notices
-    for(const r of d.notices||[]){
-      try{await pool.query(`INSERT INTO notices (id,user_id,client_id,ref_no,type,issued_date,due_date,amount,status,priority,description) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
-        [r.id,uid,r.client_id,r.ref_no,r.type,r.issued_date,r.due_date,r.amount||0,r.status||"pending",r.priority||"medium",r.description||null]);restored.notices++;}catch(e){}
-    }
-    // Restore returns
-    for(const r of d.returns||[]){
-      try{await pool.query(`INSERT INTO returns (id,user_id,client_id,period,gstr1_status,gstr3b_status,gstr9_status) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO NOTHING`,
-        [r.id,uid,r.client_id,r.period,r.gstr1_status||"not-filed",r.gstr3b_status||"not-filed",r.gstr9_status||"not-filed"]);restored.returns++;}catch(e){}
-    }
-    // Restore bank transactions
-    for(const r of d.bank_transactions||[]){
-      try{await pool.query(`INSERT INTO bank_transactions (id,user_id,bank_name,account_no,txn_date,description,debit,credit,balance,category,type) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
-        [r.id,uid,r.bank_name||"",r.account_no||"",r.txn_date,r.description,r.debit||0,r.credit||0,r.balance||0,r.category||"Uncategorized",r.type||"UNKNOWN"]);restored.bank_transactions++;}catch(e){}
-    }
-    // Restore HSN codes
-    for(const r of d.hsn_codes||[]){
-      try{await pool.query(`INSERT INTO hsn_codes (id,user_id,code,description,gst_rate,uom,chapter,is_service) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING`,
-        [r.id,uid,r.code,r.description||"",r.gst_rate||0,r.uom||"NOS",r.chapter||"",r.is_service||false]);restored.hsn_codes++;}catch(e){}
-    }
-    // Restore accounting companies
-    for(const r of (d.accounting?.companies)||[]){
-      try{await pool.query(`INSERT INTO companies (id,user_id,name,legal_name,gstin,pan,address,city,state,pincode,phone,email,fy_start,fy_end) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT (id) DO NOTHING`,
-        [r.id,uid,r.name,r.legal_name||null,r.gstin||null,r.pan||null,r.address||null,r.city||null,r.state||null,r.pincode||null,r.phone||null,r.email||null,r.fy_start||"2024-04-01",r.fy_end||"2025-03-31"]);restored.companies++;}catch(e){}
-    }
-    // Restore ledger groups
-    for(const r of (d.accounting?.ledger_groups)||[]){
-      try{await pool.query(`INSERT INTO ledger_groups (id,user_id,company_id,name,nature,affects_gross,is_default) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO NOTHING`,
-        [r.id,uid,r.company_id,r.name,r.nature||"Asset",r.affects_gross||false,r.is_default||false]);restored.ledger_groups++;}catch(e){}
-    }
-    // Restore ledgers
-    for(const r of (d.accounting?.ledgers)||[]){
-      try{await pool.query(`INSERT INTO ledgers (id,user_id,company_id,group_id,name,opening_balance,opening_type,is_default) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING`,
-        [r.id,uid,r.company_id,r.group_id,r.name,r.opening_balance||0,r.opening_type||"Dr",r.is_default||false]);restored.ledgers++;}catch(e){}
-    }
-    // Restore vouchers
-    for(const r of (d.accounting?.vouchers)||[]){
-      try{await pool.query(`INSERT INTO vouchers (id,user_id,company_id,voucher_no,voucher_type,date,narration,party_name,total_amount,is_cancelled) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (id) DO NOTHING`,
-        [r.id,uid,r.company_id,r.voucher_no,r.voucher_type,r.date,r.narration||null,r.party_name||null,r.total_amount||0,r.is_cancelled||false]);restored.vouchers++;}catch(e){}
-    }
-    // Restore voucher items
-    for(const r of (d.accounting?.voucher_items)||[]){
-      try{await pool.query(`INSERT INTO voucher_items (id,voucher_id,ledger_id,ledger_name,dr_amount,cr_amount,narration,sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING`,
-        [r.id,r.voucher_id,r.ledger_id,r.ledger_name||"",r.dr_amount||0,r.cr_amount||0,r.narration||null,r.sort_order||0]);restored.voucher_items++;}catch(e){}
-    }
-
-    const total=Object.values(restored).reduce((a,v)=>a+v,0);
-    res.json({success:true,message:`✅ Restore complete! ${total} records restored.`,restored});
-  }catch(e){res.status(500).json({success:false,message:e.message});}
-});
-
 // ══ DATA BACKUP ══
 app.get("/api/backup/export", auth, async(req,res)=>{
   try{
@@ -1293,6 +1223,92 @@ app.post("/api/backup/restore-check", auth, async(req,res)=>{
     if(!backup?.data)return res.status(400).json({success:false,message:"Invalid backup file"});
     if(backup.backup_version!=="2.0")return res.status(400).json({success:false,message:"Incompatible backup version"});
     res.json({success:true,message:"Backup file is valid",stats:backup.stats,exported_at:backup.exported_at,firm:backup.firm_name});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+
+// ══ FULL DATA RESTORE ══
+app.post("/api/backup/restore", auth, async(req,res)=>{
+  try{
+    const{backup}=req.body;
+    if(!backup?.data)return res.status(400).json({success:false,message:"Invalid backup"});
+    const uid=req.user.id;
+    const d=backup.data;
+    let restored={clients:0,invoices:0,invoice_items:0,products:0,notices:0,returns:0,reconciliation:0,payments:0,bank_transactions:0,hsn_codes:0,companies:0,ledger_groups:0,ledgers:0,vouchers:0,voucher_items:0};
+
+    // Restore clients
+    for(const r of d.clients||[]){
+      try{await pool.query(`INSERT INTO clients (id,user_id,name,gstin,state,type,turnover,notes,status,phone,email,address,city,pincode,pan,credit_limit,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,gstin=EXCLUDED.gstin`,
+        [r.id,uid,r.name,r.gstin||null,r.state||null,r.type||"Trader",r.turnover||null,r.notes||null,r.status||"compliant",r.phone||null,r.email||null,r.address||null,r.city||null,r.pincode||null,r.pan||null,r.credit_limit||0,r.created_at||new Date()]);restored.clients++;}catch(e){}
+    }
+    // Restore products
+    for(const r of d.products||[]){
+      try{await pool.query(`INSERT INTO products (id,user_id,name,code,hsn_sac,unit,category,gst_rate,purchase_price,sale_price,stock_qty,min_stock,description,is_service,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name`,
+        [r.id,uid,r.name,r.code||null,r.hsn_sac||null,r.unit||"PCS",r.category||null,r.gst_rate||18,r.purchase_price||0,r.sale_price||0,r.stock_qty||0,r.min_stock||0,r.description||null,r.is_service||false,r.created_at||new Date()]);restored.products++;}catch(e){}
+    }
+    // Restore invoices
+    for(const r of d.invoices||[]){
+      try{await pool.query(`INSERT INTO invoices (id,user_id,invoice_no,invoice_type,party_id,party_name,party_gstin,party_address,party_state,invoice_date,due_date,place_of_supply,is_igst,subtotal,taxable_amount,igst_amount,cgst_amount,sgst_amount,total_tax,total_amount,paid_amount,balance_due,status,notes,terms,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26) ON CONFLICT (id) DO NOTHING`,
+        [r.id,uid,r.invoice_no,r.invoice_type||"SALES",r.party_id||null,r.party_name,r.party_gstin||null,r.party_address||null,r.party_state||null,r.invoice_date,r.due_date||null,r.place_of_supply||null,r.is_igst||false,r.subtotal||0,r.taxable_amount||0,r.igst_amount||0,r.cgst_amount||0,r.sgst_amount||0,r.total_tax||0,r.total_amount||0,r.paid_amount||0,r.balance_due||0,r.status||"unpaid",r.notes||null,r.terms||null,r.created_at||new Date()]);restored.invoices++;}catch(e){}
+    }
+    // Restore invoice items
+    for(const r of d.invoice_items||[]){
+      try{await pool.query(`INSERT INTO invoice_items (id,invoice_id,product_id,name,hsn_sac,unit,qty,rate,discount_pct,taxable_value,gst_rate,igst_amount,cgst_amount,sgst_amount,total_amount) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT (id) DO NOTHING`,
+        [r.id,r.invoice_id,r.product_id||null,r.name,r.hsn_sac||null,r.unit||"PCS",r.qty||0,r.rate||0,r.discount_pct||0,r.taxable_value||0,r.gst_rate||0,r.igst_amount||0,r.cgst_amount||0,r.sgst_amount||0,r.total_amount||0]);restored.invoice_items++;}catch(e){}
+    }
+    // Restore payments
+    for(const r of d.payments||[]){
+      try{await pool.query(`INSERT INTO payments (id,user_id,invoice_id,party_name,type,amount,method,reference_no,payment_date) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO NOTHING`,
+        [r.id,uid,r.invoice_id,r.party_name,r.type||"RECEIVED",r.amount||0,r.method||"CASH",r.reference_no||null,r.payment_date]);restored.payments++;}catch(e){}
+    }
+    // Restore notices
+    for(const r of d.notices||[]){
+      try{await pool.query(`INSERT INTO notices (id,user_id,client_id,ref_no,type,issued_date,due_date,amount,status,priority,description) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
+        [r.id,uid,r.client_id,r.ref_no,r.type,r.issued_date,r.due_date,r.amount||0,r.status||"pending",r.priority||"medium",r.description||null]);restored.notices++;}catch(e){}
+    }
+    // Restore returns
+    for(const r of d.returns||[]){
+      try{await pool.query(`INSERT INTO returns (id,user_id,client_id,period,gstr1_status,gstr3b_status,gstr9_status) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO NOTHING`,
+        [r.id,uid,r.client_id,r.period,r.gstr1_status||"not-filed",r.gstr3b_status||"not-filed",r.gstr9_status||"not-filed"]);restored.returns++;}catch(e){}
+    }
+    // Restore bank transactions
+    for(const r of d.bank_transactions||[]){
+      try{await pool.query(`INSERT INTO bank_transactions (id,user_id,bank_name,account_no,txn_date,description,debit,credit,balance,category,type) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
+        [r.id,uid,r.bank_name||"",r.account_no||"",r.txn_date,r.description,r.debit||0,r.credit||0,r.balance||0,r.category||"Uncategorized",r.type||"UNKNOWN"]);restored.bank_transactions++;}catch(e){}
+    }
+    // Restore HSN codes
+    for(const r of d.hsn_codes||[]){
+      try{await pool.query(`INSERT INTO hsn_codes (id,user_id,code,description,gst_rate,uom,chapter,is_service) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING`,
+        [r.id,uid,r.code,r.description||"",r.gst_rate||0,r.uom||"NOS",r.chapter||"",r.is_service||false]);restored.hsn_codes++;}catch(e){}
+    }
+    // Restore accounting companies
+    for(const r of (d.accounting?.companies)||[]){
+      try{await pool.query(`INSERT INTO companies (id,user_id,name,legal_name,gstin,pan,address,city,state,pincode,phone,email,fy_start,fy_end) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT (id) DO NOTHING`,
+        [r.id,uid,r.name,r.legal_name||null,r.gstin||null,r.pan||null,r.address||null,r.city||null,r.state||null,r.pincode||null,r.phone||null,r.email||null,r.fy_start||"2024-04-01",r.fy_end||"2025-03-31"]);restored.companies++;}catch(e){}
+    }
+    // Restore ledger groups
+    for(const r of (d.accounting?.ledger_groups)||[]){
+      try{await pool.query(`INSERT INTO ledger_groups (id,user_id,company_id,name,nature,affects_gross,is_default) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO NOTHING`,
+        [r.id,uid,r.company_id,r.name,r.nature||"Asset",r.affects_gross||false,r.is_default||false]);restored.ledger_groups++;}catch(e){}
+    }
+    // Restore ledgers
+    for(const r of (d.accounting?.ledgers)||[]){
+      try{await pool.query(`INSERT INTO ledgers (id,user_id,company_id,group_id,name,opening_balance,opening_type,is_default) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING`,
+        [r.id,uid,r.company_id,r.group_id,r.name,r.opening_balance||0,r.opening_type||"Dr",r.is_default||false]);restored.ledgers++;}catch(e){}
+    }
+    // Restore vouchers
+    for(const r of (d.accounting?.vouchers)||[]){
+      try{await pool.query(`INSERT INTO vouchers (id,user_id,company_id,voucher_no,voucher_type,date,narration,party_name,total_amount,is_cancelled) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (id) DO NOTHING`,
+        [r.id,uid,r.company_id,r.voucher_no,r.voucher_type,r.date,r.narration||null,r.party_name||null,r.total_amount||0,r.is_cancelled||false]);restored.vouchers++;}catch(e){}
+    }
+    // Restore voucher items
+    for(const r of (d.accounting?.voucher_items)||[]){
+      try{await pool.query(`INSERT INTO voucher_items (id,voucher_id,ledger_id,ledger_name,dr_amount,cr_amount,narration,sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING`,
+        [r.id,r.voucher_id,r.ledger_id,r.ledger_name||"",r.dr_amount||0,r.cr_amount||0,r.narration||null,r.sort_order||0]);restored.voucher_items++;}catch(e){}
+    }
+
+    const total=Object.values(restored).reduce((a,v)=>a+v,0);
+    res.json({success:true,message:`✅ Restore complete! ${total} records restored.`,restored});
   }catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
