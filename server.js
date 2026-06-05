@@ -572,13 +572,266 @@ app.get("/api/reports/day-book",auth,async(req,res)=>{
 // ══ BANK STATEMENT ══
 const guessCategory=d=>{const t=(d||"").toLowerCase();if(t.includes("salary")||t.includes("payroll"))return"Salary";if(t.includes("rent"))return"Rent";if(t.includes("gst")||t.includes("tds"))return"Tax Payment";if(t.includes("electricity")||t.includes("utility"))return"Utilities";if(t.includes("neft")||t.includes("rtgs")||t.includes("imps"))return"Fund Transfer";if(t.includes("atm")||t.includes("cash"))return"Cash";if(t.includes("emi")||t.includes("loan"))return"Loan Payment";if(t.includes("interest"))return"Interest";if(t.includes("charges")||t.includes("fee"))return"Bank Charges";if(t.includes("insurance")||t.includes("premium"))return"Insurance";if(t.includes("purchase")||t.includes("vendor"))return"Purchase";if(t.includes("sale")||t.includes("receipt"))return"Sales Receipt";if(t.includes("amazon")||t.includes("flipkart"))return"Online Purchase";if(t.includes("petrol")||t.includes("fuel"))return"Fuel";if(t.includes("medical")||t.includes("hospital"))return"Medical";return"Uncategorized";};
 const guessType=(d,isDebit)=>{const t=(d||"").toLowerCase();if(t.includes("gst")||t.includes("tds")||t.includes("tax"))return"TAX";if(t.includes("neft")||t.includes("rtgs")||t.includes("imps")||t.includes("transfer"))return"TRANSFER";if(t.includes("emi")||t.includes("loan")||t.includes("charges")||t.includes("fee"))return"BANK";if(!isDebit)return"INCOME";if(t.includes("salary")||t.includes("rent")||t.includes("vendor"))return"EXPENSE";if(t.includes("purchase")||t.includes("supplier"))return"PURCHASE";return isDebit?"EXPENSE":"INCOME";};
-const parseTransactions=text=>{const lines=text.split("\n").map(l=>l.trim()).filter(l=>l.length>5);const txns=[];const dReg=/(\d{2}[\/\-]\d{2}[\/\-]\d{4}|\d{2}[\/\-]\d{2}[\/\-]\d{2})/;for(const line of lines){const dm=line.match(dReg);if(!dm)continue;const ds=dm[1];const ars=[];let m;const ar=/(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)/g;while((m=ar.exec(line))!==null){const v=parseFloat(m[1].replace(/,/g,""));if(v>0)ars.push(v);}if(ars.length<2)continue;let desc=line.replace(ds,"").replace(/\d{1,3}(?:,\d{3})*(?:\.\d{2})?/g,"").replace(/\s+/g," ").trim();if(!desc||desc.length<3)continue;const isDebit=line.toLowerCase().includes("dr")||line.toLowerCase().includes("debit");const debit=isDebit?ars[ars.length-3]||ars[0]||0:0;const credit=!isDebit?ars[ars.length-2]||ars[0]||0:0;const normDate=ds.replace(/(\d{2})[\/\-](\d{2})[\/\-](\d{2,4})/,(_,d,mo,y)=>`${y.length===2?"20"+y:y}-${mo}-${d}`);txns.push({txn_date:normDate,description:desc.substring(0,200),debit,credit,balance:ars[ars.length-1]||0,category:guessCategory(desc),type:guessType(desc,isDebit)});}return txns;};
+
+// ══ IMPROVED BANK STATEMENT PARSER ══
+function parseDate(raw){
+  if(!raw)return null;
+  raw=raw.toString().trim();
+  // DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY
+  let m=raw.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})/);
+  if(m){const[,d,mo,y]=m;const yr=y.length===2?`20${y}`:y;return`${yr}-${mo.padStart(2,'0')}-${d.padStart(2,'0')}`;}
+  // DD Mon YYYY (01 Jan 2024)
+  m=raw.match(/(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s\-,]+(\d{2,4})/i);
+  if(m){const months={jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};const[,d,mo,y]=m;const yr=y.length===2?`20${y}`:y;return`${yr}-${months[mo.toLowerCase().substring(0,3)]}-${d.padStart(2,'0')}`;}
+  return null;
+}
+
+function parseAmount(raw){
+  if(!raw)return 0;
+  const n=parseFloat(raw.toString().replace(/[,\s]/g,'').replace(/[^\d.]/g,''));
+  return isNaN(n)?0:n;
+}
+
+function parseTransactions(text){
+  const lines=text.split('\n').map(l=>l.trim()).filter(l=>l.length>3);
+  const transactions=[];
+
+  // Patterns for different bank statement formats
+  // Format 1: Date | Description | Debit | Credit | Balance
+  // Format 2: Date | Description | Withdrawal | Deposit | Balance
+  // Format 3: Narration | Chq/Ref | Value Date | Withdrawal | Deposit | Closing Balance
+
+  for(let i=0;i<lines.length;i++){
+    const line=lines[i];
+    // Must contain a date pattern
+    const dateMatch=line.match(/\b(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s\-,]+\d{2,4})\b/i);
+    if(!dateMatch)continue;
+
+    const txnDate=parseDate(dateMatch[1]);
+    if(!txnDate)continue;
+
+    // Extract amounts from the line (numbers with optional commas)
+    const amounts=line.match(/\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?/g)||[];
+    const numAmounts=amounts.map(a=>parseFloat(a.replace(/,/g,''))).filter(n=>n>0&&n<99999999);
+
+    // Skip if no amounts or only date-like numbers
+    if(numAmounts.length<1)continue;
+
+    // Extract description: text after date, before first large number
+    let desc=line
+      .replace(dateMatch[1],'')
+      .replace(/\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?/g,' ')
+      .replace(/[|]/g,' ')
+      .replace(/\s+/g,' ')
+      .trim();
+
+    // Clean description
+    desc=desc.replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g,'').trim();
+    if(!desc||desc.length<2)desc='Bank Transaction';
+
+    // Look ahead for description if current line too short
+    if(desc.length<5&&i+1<lines.length){
+      const nextLine=lines[i+1];
+      if(!/\d{1,2}[\/\-\.]\d{1,2}/.test(nextLine)){
+        desc=nextLine.replace(/\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?/g,'').trim()||desc;
+      }
+    }
+
+    let debit=0,credit=0;
+
+    // Determine Dr/Cr from keywords
+    const upper=line.toUpperCase();
+    const isCredit=/(CREDIT|CR|DEPOSIT|NEFT CR|IMPS CR|UPI CR|RECEIVED|BY |CASH DEP|INT CR|DIV|REFUND)/.test(upper);
+    const isDebit=/(DEBIT|DR|WITHDRAWAL|NEFT DR|IMPS DR|UPI DR|PAID|TO |ATM|PURCHASE|TRANSFER DR|EMI|LOAN)/.test(upper);
+
+    if(numAmounts.length>=2){
+      // If two+ amounts: check position or debit/credit column
+      if(isCredit&&!isDebit){credit=Math.max(...numAmounts);}
+      else if(isDebit&&!isCredit){debit=Math.max(...numAmounts);}
+      else{
+        // Heuristic: if last amount is largest it's likely balance; take second largest
+        const sorted=[...numAmounts].sort((a,b)=>b-a);
+        // Take smaller of top 2 as transaction amount
+        const txnAmt=sorted[1]||sorted[0];
+        if(isCredit)credit=txnAmt;
+        else if(isDebit)debit=txnAmt;
+        else{
+          // Unknown - check if debit column or credit column based on position
+          const pos=line.lastIndexOf(amounts[amounts.length-2]||amounts[0]);
+          const mid=line.length/2;
+          if(pos<mid)debit=txnAmt;
+          else credit=txnAmt;
+        }
+      }
+    }else if(numAmounts.length===1){
+      const amt=numAmounts[0];
+      if(isCredit&&!isDebit)credit=amt;
+      else if(isDebit&&!isCredit)debit=amt;
+      else{debit=amt;} // Default to debit if unknown
+    }
+
+    if(debit===0&&credit===0)continue;
+
+    // Categorize
+    let category="Uncategorized";
+    let type="UNKNOWN";
+    const d=desc.toUpperCase();
+    if(/(SALARY|SAL|PAYROLL)/.test(d)){category="Salary";type="INCOME";}
+    else if(/(RENT|HOUSE|HRA)/.test(d)){category="Rent";type="EXPENSE";}
+    else if(/(NEFT|RTGS|IMPS|UPI|TRANSFER)/.test(d)){category="Fund Transfer";type="TRANSFER";}
+    else if(/(ATM|CASH WD|WITHDRAWAL)/.test(d)){category="Cash";type="EXPENSE";}
+    else if(/(INTEREST|INT CR|INT PAY)/.test(d)){category="Interest";type="INCOME";}
+    else if(/(GST|TAX|TDS|INCOME TAX)/.test(d)){category="Tax Payment";type="TAX";}
+    else if(/(INSURANCE|LIC|HDFC LIFE)/.test(d)){category="Insurance";type="EXPENSE";}
+    else if(/(EMI|LOAN|MORTGAGE)/.test(d)){category="Loan Payment";type="EXPENSE";}
+    else if(/(UTILITY|ELECTRIC|WATER|INTERNET|PHONE)/.test(d)){category="Utilities";type="EXPENSE";}
+    else if(credit>0){type="INCOME";}
+    else if(debit>0){type="EXPENSE";}
+
+    // If can't determine who paid/received -> Suspense
+    const isSuspense=!isCredit&&!isDebit&&desc==='Bank Transaction';
+    if(isSuspense){category="Suspense";type="UNKNOWN";}
+
+    transactions.push({
+      txn_date:txnDate,
+      description:desc,
+      debit:debit||0,
+      credit:credit||0,
+      balance:0,
+      category:isSuspense?"Suspense":category,
+      type,
+      narration:desc, // Preserve original description as narration
+    });
+  }
+
+  // Sort by date
+  transactions.sort((a,b)=>new Date(a.txn_date)-new Date(b.txn_date));
+  return transactions;
+}
 
 app.post("/api/bank/upload",auth,upload.single("file"),async(req,res)=>{
-  try{if(!req.file)return res.status(400).json({success:false,message:"PDF required"});let text="";try{const pp=require("pdf-parse");const data=await pp(req.file.buffer);text=data.text;}catch(e){return res.status(400).json({success:false,message:"Cannot read PDF. Use digital (not scanned) PDF."});}if(!text||text.length<50)return res.status(400).json({success:false,message:"No text found in PDF."});const transactions=parseTransactions(text);if(transactions.length===0)return res.status(400).json({success:false,message:"No transactions found."});const td=transactions.reduce((a,t)=>a+(t.debit||0),0),tc=transactions.reduce((a,t)=>a+(t.credit||0),0);res.json({success:true,message:`Found ${transactions.length} transactions`,preview:{bank_name:req.body.bank_name||"Unknown Bank",account_no:req.body.account_no||"",total_txns:transactions.length,total_debit:td,total_credit:tc,transactions}});}catch(e){res.status(500).json({success:false,message:e.message});}
+  try{
+    if(!req.file)return res.status(400).json({success:false,message:"PDF required"});
+    let text="";
+    try{const pp=require("pdf-parse");const data=await pp(req.file.buffer);text=data.text;}
+    catch(e){return res.status(400).json({success:false,message:"Cannot read PDF. Use a digital (not scanned) PDF."});}
+    if(!text||text.length<50)return res.status(400).json({success:false,message:"No text found in PDF. Use a selectable-text PDF."});
+
+    const transactions=parseTransactions(text);
+    if(transactions.length===0)return res.status(400).json({success:false,message:"No transactions found. Ensure the PDF is a bank statement with date and amount columns."});
+
+    const td=transactions.reduce((a,t)=>a+(t.debit||0),0);
+    const tc=transactions.reduce((a,t)=>a+(t.credit||0),0);
+    const suspenseCount=transactions.filter(t=>t.category==="Suspense").length;
+
+    res.json({success:true,
+      message:`Found ${transactions.length} transactions (${suspenseCount} marked Suspense)`,
+      preview:{
+        bank_name:req.body.bank_name||"Unknown Bank",
+        account_no:req.body.account_no||"",
+        total_txns:transactions.length,
+        total_debit:td,total_credit:tc,
+        suspense_count:suspenseCount,
+        transactions
+      }
+    });
+  }catch(e){res.status(500).json({success:false,message:e.message});}
 });
 app.post("/api/bank/import",auth,async(req,res)=>{
-  try{const{bank_name,account_no,transactions}=req.body;if(!transactions||transactions.length===0)return res.status(400).json({success:false,message:"No transactions"});const importId=uuid();const td=transactions.reduce((a,t)=>a+(t.debit||0),0),tc=transactions.reduce((a,t)=>a+(t.credit||0),0);await pool.query("INSERT INTO bank_imports (id,user_id,bank_name,account_no,total_txns,total_debit,total_credit,filename) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",[importId,req.user.id,bank_name||"Unknown",account_no||"",transactions.length,td,tc,`statement_${Date.now()}.pdf`]);for(const t of transactions){await pool.query("INSERT INTO bank_transactions (id,user_id,bank_name,account_no,txn_date,description,debit,credit,balance,category,type,import_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",[uuid(),req.user.id,bank_name||"Unknown",account_no||"",t.txn_date,t.description,t.debit||0,t.credit||0,t.balance||0,t.category||"Uncategorized",t.type||"UNKNOWN",importId]);}res.json({success:true,message:`${transactions.length} transactions imported!`,import_id:importId});}catch(e){res.status(500).json({success:false,message:e.message});}
+  try{
+    const{bank_name,account_no,transactions,company_id,create_vouchers}=req.body;
+    if(!transactions||transactions.length===0)return res.status(400).json({success:false,message:"No transactions"});
+    const uid=req.user.id;
+    const importId=uuid();
+    const td=transactions.reduce((a,t)=>a+(t.debit||0),0);
+    const tc=transactions.reduce((a,t)=>a+(t.credit||0),0);
+
+    await pool.query("INSERT INTO bank_imports (id,user_id,bank_name,account_no,total_txns,total_debit,total_credit,filename,company_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+      [importId,uid,bank_name||"Unknown",account_no||"",transactions.length,td,tc,`statement_${Date.now()}.pdf`,company_id||null]);
+
+    let voucherCount=0;
+    let suspenseLedgerId=null;
+    let bankLedgerId=null;
+
+    // If company provided and create_vouchers=true, auto-create vouchers
+    if(company_id && create_vouchers!==false){
+      // Find or create Bank ledger
+      const bankLedger=await pool.query(
+        "SELECT id FROM ledgers WHERE company_id=$1 AND user_id=$2 AND name ILIKE $3 LIMIT 1",
+        [company_id,uid,`%${bank_name||'Bank'}%`]
+      );
+      if(bankLedger.rows[0]){bankLedgerId=bankLedger.rows[0].id;}
+      else{
+        // Find Bank Accounts group
+        const bankGrp=await pool.query("SELECT id FROM ledger_groups WHERE company_id=$1 AND user_id=$2 AND name='Bank Accounts' LIMIT 1",[company_id,uid]);
+        if(bankGrp.rows[0]){
+          bankLedgerId=uuid();
+          await pool.query("INSERT INTO ledgers (id,user_id,company_id,group_id,name,opening_balance,opening_type) VALUES ($1,$2,$3,$4,$5,0,'Dr')",
+            [bankLedgerId,uid,company_id,bankGrp.rows[0].id,bank_name||"Bank Account"]);
+        }
+      }
+
+      // Find or create Suspense ledger
+      const suspLedger=await pool.query(
+        "SELECT id FROM ledgers WHERE company_id=$1 AND user_id=$2 AND name='Suspense Account' LIMIT 1",
+        [company_id,uid]
+      );
+      if(suspLedger.rows[0]){suspenseLedgerId=suspLedger.rows[0].id;}
+      else{
+        const suspGrp=await pool.query("SELECT id FROM ledger_groups WHERE company_id=$1 AND user_id=$2 AND (name='Current Liabilities' OR name='Suspense') LIMIT 1",[company_id,uid]);
+        if(suspGrp.rows[0]){
+          suspenseLedgerId=uuid();
+          await pool.query("INSERT INTO ledgers (id,user_id,company_id,group_id,name,opening_balance,opening_type) VALUES ($1,$2,$3,$4,$5,0,'Cr')",
+            [suspenseLedgerId,uid,company_id,suspGrp.rows[0].id,"Suspense Account"]);
+        }
+      }
+    }
+
+    // Insert transactions + create vouchers
+    for(const t of transactions){
+      const txnId=uuid();
+      await pool.query(
+        "INSERT INTO bank_transactions (id,user_id,bank_name,account_no,txn_date,description,debit,credit,balance,category,type,import_id,company_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+        [txnId,uid,bank_name||"Unknown",account_no||"",t.txn_date,t.description||"Bank Transaction",t.debit||0,t.credit||0,t.balance||0,t.category||"Uncategorized",t.type||"UNKNOWN",importId,company_id||null]);
+
+      // Auto-create voucher if company selected
+      if(company_id && bankLedgerId && suspenseLedgerId && (t.debit>0||t.credit>0)){
+        try{
+          const vtype=t.credit>0?"RECEIPT":"PAYMENT";
+          const amount=t.credit>0?t.credit:t.debit;
+          const vNo=`BNK-${Date.now()}-${Math.floor(Math.random()*1000)}`;
+          const narration=t.description||t.narration||"Bank Statement Import";
+          const vId=uuid();
+
+          await pool.query(
+            "INSERT INTO vouchers (id,user_id,company_id,voucher_no,voucher_type,date,narration,total_amount,ref_no) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+            [vId,uid,company_id,vNo,vtype,t.txn_date,narration,amount,txnId]);
+
+          if(t.credit>0){
+            // RECEIPT: Debit Bank A/c, Credit Suspense (unknown source)
+            await pool.query("INSERT INTO voucher_items (id,voucher_id,ledger_id,ledger_name,dr_amount,cr_amount,narration,sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+              [uuid(),vId,bankLedgerId,bank_name||"Bank Account",amount,0,narration,1]);
+            await pool.query("INSERT INTO voucher_items (id,voucher_id,ledger_id,ledger_name,dr_amount,cr_amount,narration,sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+              [uuid(),vId,suspenseLedgerId,"Suspense Account",0,amount,narration,2]);
+          }else{
+            // PAYMENT: Credit Bank A/c, Debit Suspense (unknown destination)
+            await pool.query("INSERT INTO voucher_items (id,voucher_id,ledger_id,ledger_name,dr_amount,cr_amount,narration,sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+              [uuid(),vId,suspenseLedgerId,"Suspense Account",amount,0,narration,1]);
+            await pool.query("INSERT INTO voucher_items (id,voucher_id,ledger_id,ledger_name,dr_amount,cr_amount,narration,sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+              [uuid(),vId,bankLedgerId,bank_name||"Bank Account",0,amount,narration,2]);
+          }
+          voucherCount++;
+        }catch(ve){console.error("Voucher create error:",ve.message);}
+      }
+    }
+
+    res.json({
+      success:true,
+      message:`${transactions.length} transactions imported! ${voucherCount>0?`${voucherCount} vouchers auto-created in accounting.`:""}`,
+      import_id:importId,
+      vouchers_created:voucherCount
+    });
+  }catch(e){res.status(500).json({success:false,message:e.message});}
 });
 app.get("/api/bank/transactions",auth,async(req,res)=>{
   try{const{type,from_date,to_date}=req.query;let q="SELECT * FROM bank_transactions WHERE user_id=$1";const p=[req.user.id];if(type&&type!=="all"){q+=` AND type=$${p.length+1}`;p.push(type);}if(from_date){q+=` AND txn_date>=$${p.length+1}`;p.push(from_date);}if(to_date){q+=` AND txn_date<=$${p.length+1}`;p.push(to_date);}q+=" ORDER BY txn_date DESC, created_at DESC";const r=await pool.query(q,p);const rows=r.rows;res.json({success:true,count:rows.length,transactions:rows,summary:{total_debit:rows.reduce((a,t)=>a+parseFloat(t.debit||0),0),total_credit:rows.reduce((a,t)=>a+parseFloat(t.credit||0),0)}});}catch(e){res.status(500).json({success:false,message:e.message});}
