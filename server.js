@@ -639,112 +639,133 @@ function parseTransactions(text){
   const rawLines=text.split('\n').map(l=>l.replace(/\r/g,''));
   const transactions=[];
 
-  // Step 1: Group lines by transaction (each tx starts with a date)
-  const DATE_START=/^\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})\s/;
-  const groups=[];
-  let currentGroup=null;
+  // More flexible date patterns
+  const DATE_PATTERNS=[
+    /^\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})\s/,          // DD/MM/YYYY at start
+    /^\s*(\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})\s/,             // YYYY/MM/DD at start
+    /^\s*(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4})\s/i, // DD Mon YYYY
+  ];
 
+  const tryParseDate=(str)=>{
+    // DD/MM/YY or DD/MM/YYYY
+    let m=str.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})$/);
+    if(m){const[,d,mo,y]=m;const yr=y.length===2?(parseInt(y)>50?`19${y}`:`20${y}`):y;const md=`${yr}-${mo.padStart(2,'0')}-${d.padStart(2,'0')}`;if(new Date(md).toString()!=='Invalid Date')return md;}
+    // YYYY/MM/DD
+    m=str.match(/^(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})$/);
+    if(m){const[,y,mo,d]=m;return`${y}-${mo.padStart(2,'0')}-${d.padStart(2,'0')}`;}
+    // DD Mon YYYY
+    m=str.match(/^(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s\-,]*(\d{2,4})$/i);
+    if(m){const months={jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};const[,d,mo,y]=m;const yr=y.length===2?`20${y}`:y;return`${yr}-${months[mo.toLowerCase().substring(0,3)]}-${d.padStart(2,'0')}`;}
+    return null;
+  };
+
+  // Step 1: Try structured parsing (date at line start)
+  let groups=[];
+  let currentGroup=null;
   for(const line of rawLines){
-    const dm=line.match(DATE_START);
-    if(dm&&parseDate(dm[1])){
-      // New transaction starts
+    let dateFound=null;
+    for(const pat of DATE_PATTERNS){
+      const dm=line.match(pat);
+      if(dm){const d=tryParseDate(dm[1].trim());if(d){dateFound=d;break;}}
+    }
+    if(dateFound){
       if(currentGroup)groups.push(currentGroup);
-      currentGroup={date:parseDate(dm[1]),lines:[line.trim()]};
-    }else if(currentGroup&&line.trim().length>2){
-      // Continuation line - part of current transaction narration
+      currentGroup={date:dateFound,lines:[line.trim()]};
+    }else if(currentGroup&&line.trim().length>1){
       currentGroup.lines.push(line.trim());
     }
   }
   if(currentGroup)groups.push(currentGroup);
 
-  // Step 2: Parse each group
+  // Step 2: If no structured groups found, try scanning all lines for dates
+  if(groups.length===0){
+    const DATE_IN_LINE=/\b(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})\b/g;
+    for(const line of rawLines){
+      const matches=[...line.matchAll(DATE_IN_LINE)];
+      for(const m of matches){
+        const d=tryParseDate(m[1]);
+        if(d&&line.length>20){
+          groups.push({date:d,lines:[line.trim()]});
+          break;
+        }
+      }
+    }
+  }
+
+  if(groups.length===0)return [];
+
+  // Step 3: Parse each group
+  const isRefNo=(s)=>/^\d{9,}$/.test(s.trim())||/^[A-Z0-9]{14,}$/.test(s.trim());
+
   for(const grp of groups){
     const fullText=grp.lines.join(' ');
-
-    // Extract all numbers (amounts) - filter out dates, ref numbers
     const parts=fullText.split(/\s+/);
-    const amounts=[];
+    const amountsRaw=[];
     const narrationParts=[];
 
     for(const part of parts){
       const clean=part.replace(/,/g,'');
-      // Skip if it's the date
-      if(isDateStr(part))continue;
-      // Check if it looks like an amount (has decimals or is a reasonable number)
-      const amtMatch=clean.match(/^(\d{1,3}(?:\d{3})*(?:\.\d{1,2})?)$/);
-      if(amtMatch){
-        const val=parseFloat(clean);
-        // Amounts between 0.01 and 99,999,999
-        if(val>0&&val<99999999&&clean.includes('.')){
-          amounts.push(val);
-          continue;
-        }
-        // Also catch amounts like 50000 (no decimal in statement)
-        if(val>=1&&val<=9999999&&!isRefNo(clean)){
-          amounts.push(val);
-          continue;
-        }
-      }
-      // Skip reference numbers (long digit strings)
+      if(tryParseDate(part.trim()))continue;
       if(isRefNo(part))continue;
-      // Keep as narration
-      if(part.length>1)narrationParts.push(part);
+      // Amount with decimal
+      if(/^\d{1,3}(,\d{3})*(\.\d{1,2})?$/.test(part)&&!isRefNo(clean)){
+        const val=parseFloat(clean);
+        if(val>0&&val<99999999){amountsRaw.push({val,str:part});continue;}
+      }
+      if(part.length>1&&!/^\d+$/.test(part))narrationParts.push(part);
     }
 
-    // Build narration from non-numeric, non-ref parts
-    let narration=narrationParts
-      .filter(p=>!isDateStr(p))
-      .join(' ')
-      .replace(/\s+/g,' ')
-      .trim();
-
-    // Remove leading date from narration
+    let narration=narrationParts.filter(p=>!tryParseDate(p)&&p.length>1).join(' ').replace(/\s+/g,' ').trim();
     narration=narration.replace(/^\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\s*/,'').trim();
     if(!narration||narration.length<2)narration='Bank Transaction';
 
-    if(amounts.length===0)continue;
+    if(amountsRaw.length===0)continue;
 
-    // Determine debit/credit from amounts
-    // For statements with 3 amounts: [Withdrawal, Deposit, Balance] or [Debit, Credit, Balance]
-    // For statements with 2 amounts: [Transaction, Balance]
-    // For statements with 1 amount: [Balance only - skip OR transaction]
+    const vals=amountsRaw.map(a=>a.val);
     let debit=0,credit=0;
-
     const upper=fullText.toUpperCase();
-    const hasCrKeyword=/(CREDIT|CR\b|DEPOSIT|RECEIVED|PAYMENT FROM|DEPOSIT AMT|DEP\.|CASHBACK|REFUND|RECEIVED|SALARY|INT CR|NEFT CR|IMPS CR|UPI CR|\bCR\b)/.test(upper);
-    const hasDbKeyword=/(DEBIT|DR\b|WITHDRAWAL|PAID|PAYMENT TO|ATM|PURCHASE|EMI|NEFT DR|IMPS DR|UPI DR|\bDR\b|WDL|WITHDRAWAL AMT)/.test(upper);
+    const isCr=/(CREDIT|CR\b|\bCR\b|DEPOSIT|DEP\.|RECEIVED|PAYMENT FROM|NEFT CR|IMPS CR|UPI CR|CASHBACK|REFUND|INT CR|BY |SALARY|DIVIDEND)/.test(upper);
+    const isDr=/(DEBIT|DR\b|\bDR\b|WITHDRAWAL|WDL|PAID|ATM|PURCHASE|NEFT DR|IMPS DR|UPI DR|EMI|LOAN|TO )/.test(upper);
 
-    if(amounts.length>=3){
-      // [Withdrawal/0, Deposit/0, Balance] - take first two
-      const a1=amounts[amounts.length-3];
-      const a2=amounts[amounts.length-2];
-      // balance is last
-      if(a1>0&&a2===0){debit=a1;}
-      else if(a1===0&&a2>0){credit=a2;}
-      else if(a1>0&&a2>0){
-        // Both non-zero: one is txn, other might be closing balance of prev
-        // Use keyword to determine
-        if(hasCrKeyword&&!hasDbKeyword)credit=Math.min(a1,a2);
-        else debit=Math.min(a1,a2);
-      }
-    }else if(amounts.length===2){
-      // [Transaction, Balance]
-      const txnAmt=amounts[0];
-      if(hasCrKeyword&&!hasDbKeyword)credit=txnAmt;
-      else if(hasDbKeyword&&!hasCrKeyword)debit=txnAmt;
-      else{
-        // Can't determine - use Suspense
-        debit=txnAmt; // default to debit, mark as suspense
-      }
-    }else if(amounts.length===1){
-      // Only one amount - likely balance, skip
-      continue;
+    if(vals.length>=3){
+      // Likely [Withdrawal, Deposit, Balance] - skip balance (last)
+      const w=vals[vals.length-3]||0;
+      const d=vals[vals.length-2]||0;
+      if(w>0&&d===0)debit=w;
+      else if(w===0&&d>0)credit=d;
+      else if(w>0&&d>0){if(isCr&&!isDr)credit=Math.min(w,d);else debit=Math.min(w,d);}
+    }else if(vals.length===2){
+      const txnAmt=vals[0];
+      if(isCr&&!isDr)credit=txnAmt;
+      else if(isDr&&!isCr)debit=txnAmt;
+      else debit=txnAmt; // default debit
+    }else if(vals.length===1){
+      if(isCr&&!isDr)credit=vals[0];
+      else debit=vals[0];
     }
 
     if(debit===0&&credit===0)continue;
 
+    // Categorize
+    const categorize=(d)=>{
+      const u=d.toUpperCase();
+      if(/(SALARY|SAL\/|PAYROLL)/.test(u))return{c:"Salary",t:"INCOME"};
+      if(/(RENT|LEASE)/.test(u))return{c:"Rent",t:"EXPENSE"};
+      if(/(UPI|PHONEPE|GPAY|PAYTM|BHIM)/.test(u)){if(isCr)return{c:"UPI Receipt",t:"INCOME"};return{c:"UPI Payment",t:"EXPENSE"};}
+      if(/(NEFT|RTGS|IMPS|FT-)/.test(u))return{c:"Fund Transfer",t:"TRANSFER"};
+      if(/(ATM|CASH WD|ATM WDL)/.test(u))return{c:"Cash",t:"EXPENSE"};
+      if(/(GST|TDS|INCOME TAX|TAX PMT)/.test(u))return{c:"Tax Payment",t:"TAX"};
+      if(/(EMI|LOAN|MORTGAGE)/.test(u))return{c:"Loan Payment",t:"EXPENSE"};
+      if(/(INTEREST|INT CR|DIVIDEND)/.test(u))return{c:"Interest",t:"INCOME"};
+      if(/(INSURANCE|LIC|LIFE INS)/.test(u))return{c:"Insurance",t:"EXPENSE"};
+      if(/(REFUND|REVERSAL)/.test(u))return{c:"Refund",t:"INCOME"};
+      if(isCr)return{c:"Receipt",t:"INCOME"};
+      if(isDr)return{c:"Payment",t:"EXPENSE"};
+      return{c:"Suspense",t:"UNKNOWN"};
+    };
+
     const{c:category,t:type}=categorize(narration);
-    const isSuspense=!hasCrKeyword&&!hasDbKeyword;
+    const isSuspense=!isCr&&!isDr;
 
     transactions.push({
       txn_date:grp.date,
@@ -752,13 +773,12 @@ function parseTransactions(text){
       narration:narration.substring(0,500),
       debit:Math.round(debit*100)/100,
       credit:Math.round(credit*100)/100,
-      balance:Math.round((amounts[amounts.length-1]||0)*100)/100,
+      balance:vals.length>0?Math.round((vals[vals.length-1])*100)/100:0,
       category:isSuspense?'Suspense':category,
       type:isSuspense?'UNKNOWN':type,
     });
   }
 
-  // Sort by date
   transactions.sort((a,b)=>new Date(a.txn_date)-new Date(b.txn_date));
   return transactions;
 }
@@ -889,8 +909,47 @@ app.post("/api/bank/import",auth,async(req,res)=>{
   }catch(e){res.status(500).json({success:false,message:e.message});}
 });
 app.get("/api/bank/transactions",auth,async(req,res)=>{
-  try{const{type,from_date,to_date}=req.query;let q="SELECT * FROM bank_transactions WHERE user_id=$1";const p=[req.user.id];if(type&&type!=="all"){q+=` AND type=$${p.length+1}`;p.push(type);}if(from_date){q+=` AND txn_date>=$${p.length+1}`;p.push(from_date);}if(to_date){q+=` AND txn_date<=$${p.length+1}`;p.push(to_date);}q+=" ORDER BY txn_date DESC, created_at DESC";const r=await pool.query(q,p);const rows=r.rows;res.json({success:true,count:rows.length,transactions:rows,summary:{total_debit:rows.reduce((a,t)=>a+parseFloat(t.debit||0),0),total_credit:rows.reduce((a,t)=>a+parseFloat(t.credit||0),0)}});}catch(e){res.status(500).json({success:false,message:e.message});}
+  try{
+    const{type,from_date,to_date,company_id}=req.query;
+    let q="SELECT * FROM bank_transactions WHERE user_id=$1";
+    const p=[req.user.id];
+    if(type&&type!=="all"){q+=` AND type=$${p.length+1}`;p.push(type);}
+    if(from_date){q+=` AND txn_date>=$${p.length+1}`;p.push(from_date);}
+    if(to_date){q+=` AND txn_date<=$${p.length+1}`;p.push(to_date);}
+    if(company_id){q+=` AND (company_id=$${p.length+1} OR company_id IS NULL)`;p.push(company_id);}
+    q+=" ORDER BY txn_date ASC, created_at ASC";
+    const r=await pool.query(q,p);
+    res.json({success:true,transactions:r.rows,count:r.rows.length});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
 });
+
+// Delete single transaction
+app.delete("/api/bank/transactions/:id",auth,async(req,res)=>{
+  try{await pool.query("DELETE FROM bank_transactions WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);res.json({success:true});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// Delete all transactions for an import
+app.delete("/api/bank/imports/:id",auth,async(req,res)=>{
+  try{
+    await pool.query("DELETE FROM bank_transactions WHERE import_id=$1 AND user_id=$2",[req.params.id,req.user.id]);
+    await pool.query("DELETE FROM bank_imports WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);
+    res.json({success:true,message:"Import deleted with all transactions"});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// Delete ALL bank transactions (company-specific)
+app.delete("/api/bank/transactions-all",auth,async(req,res)=>{
+  try{
+    const{company_id}=req.query;
+    if(company_id){
+      await pool.query("DELETE FROM bank_transactions WHERE user_id=$1 AND company_id=$2",[req.user.id,company_id]);
+    }else{
+      await pool.query("DELETE FROM bank_transactions WHERE user_id=$1",[req.user.id]);
+      await pool.query("DELETE FROM bank_imports WHERE user_id=$1",[req.user.id]);
+    }
+    res.json({success:true,message:"All bank transactions cleared"});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+})
 app.get("/api/bank/imports",auth,async(req,res)=>{
   try{const r=await pool.query("SELECT * FROM bank_imports WHERE user_id=$1 ORDER BY created_at DESC",[req.user.id]);res.json({success:true,imports:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
@@ -1427,6 +1486,7 @@ app.get("/api/hsn/code/:code",auth,async(req,res)=>{
 app.get("/api/backup/export", auth, async(req,res)=>{
   try{
     const uid = req.user.id;
+    const{company_id}=req.query;
     const user = await pool.query("SELECT id,name,email,firm_name,frn,role FROM users WHERE id=$1",[uid]);
 
     // Fetch all data in parallel
@@ -1510,17 +1570,18 @@ app.get("/api/backup/export", auth, async(req,res)=>{
 app.get("/api/backup/stats", auth, async(req,res)=>{
   try{
     const uid=req.user.id;
+    const{company_id}=req.query;
+    const cFilter=company_id?` AND (company_id='${company_id}' OR company_id IS NULL)`:"";
     const tables=["clients","invoices","products","notices","returns","reconciliation","bank_transactions","vouchers","hsn_codes","payments","challans"];
     const stats={};
     for(const t of tables){
       try{
-        const r=await pool.query(`SELECT COUNT(*) as c FROM ${t} WHERE user_id=$1`,[uid]);
+        const r=await pool.query(`SELECT COUNT(*) as c FROM ${t} WHERE user_id=$1${cFilter}`,[uid]);
         stats[t]=parseInt(r.rows[0].c);
       }catch(e){stats[t]=0;}
     }
     const total=Object.values(stats).reduce((a,v)=>a+v,0);
-    const lastInvoice=await pool.query("SELECT created_at FROM invoices WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1",[uid]);
-    res.json({success:true,stats,total_records:total,last_invoice:lastInvoice.rows[0]?.created_at||null});
+    res.json({success:true,stats,total_records:total,company_id:company_id||null});
   }catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
