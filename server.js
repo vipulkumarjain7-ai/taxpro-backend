@@ -467,7 +467,7 @@ app.delete("/api/reconciliation/:id",auth,async(req,res)=>{
 
 // ══ PRODUCTS ══
 app.get("/api/products",auth,async(req,res)=>{
-  try{const{search,company_id}=req.query;let q="SELECT * FROM products WHERE user_id=$1";const p=[req.user.id];if(company_id){q+=` AND (company_id=$${p.length+1} OR company_id IS NULL)`;p.push(company_id);}if(search){q+=` AND (name ILIKE $${p.length+1} OR code ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}q+=" ORDER BY name ASC";const r=await pool.query(q,p);res.json({success:true,products:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
+  try{const{search,company_id}=req.query;let q="SELECT * FROM products WHERE user_id=$1";const p=[req.user.id];if(company_id){q+=` AND company_id=$${p.length+1}`;p.push(company_id);}if(search){q+=` AND (name ILIKE $${p.length+1} OR code ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}q+=" ORDER BY name ASC";const r=await pool.query(q,p);res.json({success:true,products:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 app.post("/api/products",auth,async(req,res)=>{
   try{const{name,code,hsn_sac,unit,category,gst_rate,purchase_price,sale_price,stock_qty,min_stock,description,is_service,company_id}=req.body;if(!name)return res.status(400).json({success:false,message:"Name required"});const id=uuid();await pool.query("INSERT INTO products (id,user_id,name,code,hsn_sac,unit,category,gst_rate,purchase_price,sale_price,stock_qty,min_stock,description,is_service,company_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",[id,req.user.id,name,code||null,hsn_sac||null,unit||"PCS",category||null,parseFloat(gst_rate)||18,parseFloat(purchase_price)||0,parseFloat(sale_price)||0,parseFloat(stock_qty)||0,parseFloat(min_stock)||0,description||null,is_service===true||is_service==='true'?1:0,company_id||null]);if(parseFloat(stock_qty)>0)await pool.query("INSERT INTO stock_movements (id,user_id,product_id,type,qty,rate,reference,notes) VALUES ($1,$2,$3,'OPENING',$4,$5,'Opening Stock','Opening stock')",[uuid(),req.user.id,id,parseFloat(stock_qty),parseFloat(purchase_price)||0]);const r=await pool.query("SELECT * FROM products WHERE id=$1",[id]);res.status(201).json({success:true,message:"Product added",product:r.rows[0]});}catch(e){res.status(500).json({success:false,message:e.message});}
@@ -488,7 +488,7 @@ app.get("/api/invoices/stats/summary",auth,async(req,res)=>{
   try{const uid=req.user.id,today=new Date().toISOString().split("T")[0],month=today.substring(0,7);const[s,p,o,ov]=await Promise.all([pool.query("SELECT COALESCE(SUM(total_amount),0) as t FROM invoices WHERE user_id=$1 AND invoice_type='SALES' AND invoice_date LIKE $2",[uid,`${month}%`]),pool.query("SELECT COALESCE(SUM(total_amount),0) as t FROM invoices WHERE user_id=$1 AND invoice_type='PURCHASE' AND invoice_date LIKE $2",[uid,`${month}%`]),pool.query("SELECT COALESCE(SUM(balance_due),0) as t FROM invoices WHERE user_id=$1 AND status IN ('unpaid','partial')",[uid]),pool.query("SELECT COALESCE(SUM(balance_due),0) as t FROM invoices WHERE user_id=$1 AND status IN ('unpaid','partial') AND due_date < $2",[uid,today])]);res.json({success:true,stats:{monthly_sales:parseFloat(s.rows[0].t),monthly_purchases:parseFloat(p.rows[0].t),total_outstanding:parseFloat(o.rows[0].t),overdue_amount:parseFloat(ov.rows[0].t)}});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 app.get("/api/invoices",auth,async(req,res)=>{
-  try{const{type,status,search,company_id}=req.query;let q="SELECT * FROM invoices WHERE user_id=$1";const p=[req.user.id];if(company_id){q+=` AND (company_id=$${p.length+1} OR company_id IS NULL)`;p.push(company_id);}if(type){q+=` AND invoice_type=$${p.length+1}`;p.push(type);}if(status){q+=` AND status=$${p.length+1}`;p.push(status);}if(search){q+=` AND (party_name ILIKE $${p.length+1} OR invoice_no ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}q+=" ORDER BY created_at DESC";const r=await pool.query(q,p);const invs=r.rows;res.json({success:true,count:invs.length,invoices:invs,summary:{total_amount:invs.reduce((a,i)=>a+parseFloat(i.total_amount||0),0),total_outstanding:invs.reduce((a,i)=>a+parseFloat(i.balance_due||0),0)}});}catch(e){res.status(500).json({success:false,message:e.message});}
+  try{const{type,status,search,company_id}=req.query;let q="SELECT * FROM invoices WHERE user_id=$1";const p=[req.user.id];if(company_id){q+=` AND company_id=$${p.length+1}`;p.push(company_id);}else{/* no filter - show all */}if(type){q+=` AND invoice_type=$${p.length+1}`;p.push(type);}if(status){q+=` AND status=$${p.length+1}`;p.push(status);}if(search){q+=` AND (party_name ILIKE $${p.length+1} OR invoice_no ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}q+=" ORDER BY created_at DESC";const r=await pool.query(q,p);const invs=r.rows;res.json({success:true,count:invs.length,invoices:invs,summary:{total_amount:invs.reduce((a,i)=>a+parseFloat(i.total_amount||0),0),total_outstanding:invs.reduce((a,i)=>a+parseFloat(i.balance_due||0),0)}});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 app.get("/api/invoices/:id",auth,async(req,res)=>{
   try{const inv=await pool.query("SELECT * FROM invoices WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);if(!inv.rows[0])return res.status(404).json({success:false,message:"Not found"});const items=await pool.query("SELECT * FROM invoice_items WHERE invoice_id=$1 ORDER BY id",[req.params.id]);const pays=await pool.query("SELECT * FROM payments WHERE invoice_id=$1 ORDER BY payment_date DESC",[req.params.id]);res.json({success:true,invoice:{...inv.rows[0],items:items.rows,payments:pays.rows}});}catch(e){res.status(500).json({success:false,message:e.message});}
@@ -534,7 +534,7 @@ app.delete("/api/invoices/:id",auth,async(req,res)=>{
 
 // ══ PARTIES ══
 app.get("/api/parties",auth,async(req,res)=>{
-  try{const{search,company_id}=req.query;let q="SELECT c.*,COALESCE((SELECT SUM(balance_due) FROM invoices WHERE party_id=c.id AND status IN ('unpaid','partial')),0) as outstanding FROM clients c WHERE c.user_id=$1";const p=[req.user.id];if(company_id){q+=` AND (c.company_id=$${p.length+1} OR c.company_id IS NULL)`;p.push(company_id);}if(search){q+=` AND (c.name ILIKE $${p.length+1} OR c.gstin ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}q+=" ORDER BY c.name ASC";const r=await pool.query(q,p);res.json({success:true,parties:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
+  try{const{search,company_id}=req.query;let q="SELECT c.*,COALESCE((SELECT SUM(balance_due) FROM invoices WHERE party_id=c.id AND status IN ('unpaid','partial')),0) as outstanding FROM clients c WHERE c.user_id=$1";const p=[req.user.id];if(company_id){q+=` AND c.company_id=$${p.length+1}`;p.push(company_id);}if(search){q+=` AND (c.name ILIKE $${p.length+1} OR c.gstin ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}q+=" ORDER BY c.name ASC";const r=await pool.query(q,p);res.json({success:true,parties:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 app.post("/api/parties",auth,async(req,res)=>{
   try{const{name,gstin,state,type,phone,email,address,city,pincode,pan,credit_limit}=req.body;if(!name)return res.status(400).json({success:false,message:"Name required"});const id=uuid();await pool.query("INSERT INTO clients (id,user_id,name,gstin,state,type,phone,email,address,city,pincode,pan,credit_limit) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",[id,req.user.id,name,gstin||null,state||null,type||"Customer",phone||null,email||null,address||null,city||null,pincode||null,pan||null,parseFloat(credit_limit)||0]);const r=await pool.query("SELECT * FROM clients WHERE id=$1",[id]);res.status(201).json({success:true,message:"Party added",party:r.rows[0]});}catch(e){res.status(500).json({success:false,message:e.message});}
@@ -828,8 +828,48 @@ app.post("/api/bank/upload",auth,upload.single("file"),async(req,res)=>{
     catch(e){return res.status(400).json({success:false,message:"Cannot read PDF. Use a digital (not scanned) PDF."});}
     if(!text||text.length<50)return res.status(400).json({success:false,message:"No text found in PDF. Use a selectable-text PDF."});
 
-    const transactions=parseTransactions(text);
-    if(transactions.length===0)return res.status(400).json({success:false,message:"No transactions found. Ensure the PDF is a bank statement with date and amount columns."});
+    let transactions=parseTransactions(text);
+
+    // AI fallback when regex parser fails
+    if(transactions.length===0&&process.env.GROQ_API_KEY){
+      try{
+        const Groq=require("groq-sdk");const groq=new Groq({apiKey:process.env.GROQ_API_KEY});
+        const sample=text.substring(0,3000);
+        const completion=await groq.chat.completions.create({
+          model:"llama3-8b-8192",
+          messages:[{role:"user",content:`Extract bank transactions from this bank statement text. Return ONLY a JSON array like:
+[{"date":"YYYY-MM-DD","description":"narration text","debit":0,"credit":0,"balance":0}]
+Rules: 1) date must be YYYY-MM-DD format 2) debit=withdrawal/payment 3) credit=deposit/receipt 4) omit header/footer rows 5) balance is closing balance after txn.
+Bank Statement Text:
+${sample}`}],
+          temperature:0.1,max_tokens:2000
+        });
+        const reply=completion.choices[0]?.message?.content||"";
+        const jsonMatch=reply.match(/\[[\s\S]*\]/);
+        if(jsonMatch){
+          const aiTxns=JSON.parse(jsonMatch[0]);
+          if(Array.isArray(aiTxns)&&aiTxns.length>0){
+            transactions=aiTxns.map(t=>({
+              txn_date:t.date,description:t.description||"Bank Transaction",
+              narration:t.description||"Bank Transaction",
+              debit:parseFloat(t.debit)||0,credit:parseFloat(t.credit)||0,
+              balance:parseFloat(t.balance)||0,
+              category:parseFloat(t.credit)>0?"Receipt":"Payment",
+              type:parseFloat(t.credit)>0?"INCOME":"EXPENSE"
+            }));
+          }
+        }
+      }catch(aiErr){console.error("AI parse failed:",aiErr.message);}
+    }
+
+    if(transactions.length===0){
+      // Return extracted text for debugging
+      return res.status(400).json({
+        success:false,
+        message:"No transactions found. The PDF may be scanned/image-based or use an unsupported format.",
+        debug_text:text.substring(0,500)
+      });
+    }
 
     const td=transactions.reduce((a,t)=>a+(t.debit||0),0);
     const tc=transactions.reduce((a,t)=>a+(t.credit||0),0);
