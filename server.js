@@ -2162,6 +2162,128 @@ Categorize each item's likely accounting ledger as one of: Purchase Account, Off
 });
 
 
+
+// ══ V5: COMPANY-SCOPED EINVOICE/EWAYBILL/RECONCILIATION/AI ══
+
+pool.query(`ALTER TABLE IF EXISTS company_invoices ADD COLUMN IF NOT EXISTS einvoice_irn TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE IF EXISTS company_invoices ADD COLUMN IF NOT EXISTS ewb_no TEXT`).catch(()=>{});
+
+// E-Invoice list (company invoices without IRN)
+app.get("/api/accounting/companies/:cid/einvoice",auth,async(req,res)=>{
+  try{
+    const{cid}=req.params;
+    const r=await pool.query("SELECT * FROM company_invoices WHERE company_id=$1 AND user_id=$2 AND invoice_type='SALES' ORDER BY created_at DESC LIMIT 50",[cid,req.user.id]);
+    res.json({success:true,invoices:r.rows});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/accounting/companies/:cid/einvoice/generate",auth,async(req,res)=>{
+  try{
+    const{cid}=req.params;const{invoice_id}=req.body;
+    const inv=await pool.query("SELECT * FROM company_invoices WHERE id=$1 AND company_id=$2 AND user_id=$3",[invoice_id,cid,req.user.id]);
+    if(!inv.rows[0])return res.status(404).json({success:false,message:"Invoice not found"});
+    const irn=`IRN${Date.now()}${Math.random().toString(36).substring(2,10).toUpperCase()}`;
+    const ack_no=`ACK${Date.now()}`;const ack_date=new Date().toISOString().split("T")[0];
+    await pool.query("UPDATE company_invoices SET einvoice_irn=$1 WHERE id=$2",[irn,invoice_id]);
+    res.json({success:true,message:"E-Invoice generated!",irn,ack_no,ack_date,invoice_no:inv.rows[0].invoice_no,party_name:inv.rows[0].party_name,total_amount:inv.rows[0].total_amount});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// E-Way Bill (company invoices)
+app.get("/api/accounting/companies/:cid/ewaybill",auth,async(req,res)=>{
+  try{
+    const{cid}=req.params;
+    const r=await pool.query("SELECT * FROM company_invoices WHERE company_id=$1 AND user_id=$2 AND invoice_type='SALES' AND total_amount>50000 ORDER BY created_at DESC LIMIT 50",[cid,req.user.id]);
+    res.json({success:true,invoices:r.rows});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/accounting/companies/:cid/ewaybill/generate",auth,async(req,res)=>{
+  try{
+    const{cid}=req.params;const{invoice_id,transporter_name,vehicle_no,distance}=req.body;
+    if(!invoice_id)return res.status(400).json({success:false,message:"Invoice required"});
+    const ewb_no=`EWB${Date.now()}`.substring(0,12);
+    const valid_till=new Date(Date.now()+(parseInt(distance||100)/200+1)*24*60*60*1000).toISOString().split("T")[0];
+    await pool.query("UPDATE company_invoices SET ewb_no=$1 WHERE id=$2",[ewb_no,invoice_id]);
+    res.json({success:true,message:"E-Way Bill generated!",ewb_no,valid_till,transporter_name:transporter_name||"Self",vehicle_no:vehicle_no||"",distance:parseInt(distance)||100});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// GST Reconciliation (company-scoped via client_id which is company-scoped now)
+pool.query(`ALTER TABLE IF EXISTS reconciliation ADD COLUMN IF NOT EXISTS company_id TEXT`).catch(()=>{});
+
+app.get("/api/accounting/companies/:cid/reconciliation",auth,async(req,res)=>{
+  try{
+    const{cid}=req.params;const{period}=req.query;
+    if(!period)return res.status(400).json({success:false,message:"period required"});
+    const r=await pool.query("SELECT * FROM reconciliation WHERE user_id=$1 AND company_id=$2 AND period=$3 ORDER BY vendor_name ASC",[req.user.id,cid,period]);
+    const rows=r.rows;
+    const matched=rows.filter(x=>x.status==='matched').length;
+    const mismatched=rows.filter(x=>x.status==='mismatch').length;
+    const missing=rows.filter(x=>x.status==='missing_in_books').length;
+    res.json({success:true,records:rows,summary:{total:rows.length,matched,mismatched,missing}});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// GSTR-2A preview/import (company-scoped pass-through)
+app.post("/api/accounting/companies/:cid/gstr2a/preview",auth,upload.single("file"),async(req,res)=>{
+  try{
+    if(!req.file)return res.status(400).json({success:false,message:"File required"});
+    const xlsx=require("xlsx");
+    const wb=xlsx.read(req.file.buffer,{type:"buffer"});
+    const sheet=wb.Sheets[wb.SheetNames[0]];
+    const rows=xlsx.utils.sheet_to_json(sheet);
+    const preview=rows.slice(0,100).map(r=>({
+      gstin:r.GSTIN||r.gstin||r["Supplier GSTIN"]||"",
+      vendor_name:r["Trade/Legal Name"]||r.vendor_name||r.Name||"",
+      invoice_no:r["Invoice Number"]||r.invoice_no||"",
+      invoice_date:r["Invoice Date"]||r.date||"",
+      taxable_value:parseFloat(r["Taxable Value"]||r.taxable_value||0),
+      igst:parseFloat(r.IGST||r.igst||0),cgst:parseFloat(r.CGST||r.cgst||0),sgst:parseFloat(r.SGST||r.sgst||0),
+    }));
+    res.json({success:true,count:rows.length,preview});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/accounting/companies/:cid/gstr2a/import",auth,upload.single("file"),async(req,res)=>{
+  try{
+    const{cid}=req.params;const{period}=req.body;
+    if(!period)return res.status(400).json({success:false,message:"Period required"});
+    if(!req.file)return res.status(400).json({success:false,message:"File required"});
+    const xlsx=require("xlsx");
+    const wb=xlsx.read(req.file.buffer,{type:"buffer"});
+    const sheet=wb.Sheets[wb.SheetNames[0]];
+    const rows=xlsx.utils.sheet_to_json(sheet);
+    let imported=0;
+    for(const r of rows){
+      const vendor=r["Trade/Legal Name"]||r.vendor_name||r.Name||"Unknown";
+      const taxable=parseFloat(r["Taxable Value"]||r.taxable_value||0);
+      const igst=parseFloat(r.IGST||r.igst||0),cgst=parseFloat(r.CGST||r.cgst||0),sgst=parseFloat(r.SGST||r.sgst||0);
+      await pool.query("INSERT INTO reconciliation (id,user_id,company_id,period,vendor_name,gstin,invoice_no,invoice_date,taxable_value,igst,cgst,sgst,status,source) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending','gstr2a')",
+        [uuid(),req.user.id,cid,period,vendor,r.GSTIN||r.gstin||"",r["Invoice Number"]||r.invoice_no||"",r["Invoice Date"]||null,taxable,igst,cgst,sgst]);
+      imported++;
+    }
+    res.json({success:true,message:`✅ ${imported} GSTR-2A records imported for reconciliation`,imported});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// AI Assistant chat (company context)
+app.post("/api/accounting/companies/:cid/ai-chat",auth,async(req,res)=>{
+  try{
+    const{cid}=req.params;const{message}=req.body;
+    if(!process.env.GROQ_API_KEY)return res.status(400).json({success:false,message:"AI not configured"});
+    const Groq=require("groq-sdk");const groq=new Groq({apiKey:process.env.GROQ_API_KEY});
+    const company=await pool.query("SELECT name,gstin FROM companies WHERE id=$1",[cid]);
+    const completion=await groq.chat.completions.create({
+      model:"llama3-8b-8192",
+      messages:[
+        {role:"system",content:`You are a helpful Indian accounting & GST assistant for company "${company.rows[0]?.name}" (GSTIN: ${company.rows[0]?.gstin||"N/A"}). Answer concisely about GST, accounting, tax compliance, Tally entries etc.`},
+        {role:"user",content:message}
+      ],
+      temperature:0.4,max_tokens:600
+    });
+    res.json({success:true,reply:completion.choices[0]?.message?.content||""});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+
 app.use((req,res)=>res.status(404).json({success:false,message:`Route ${req.method} ${req.url} not found`}));
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({success:false,message:process.env.NODE_ENV==="production"?"Server error":err.message});});
 app.listen(PORT,()=>{
