@@ -414,7 +414,7 @@ app.get("/api/dashboard", auth, async(req,res)=>{
 
 // ══ CLIENTS ══
 app.get("/api/clients",auth,async(req,res)=>{
-  try{const{search,status}=req.query;let q="SELECT c.*,(SELECT COUNT(*) FROM notices n WHERE n.client_id=c.id AND n.status NOT IN ('closed','replied')) as notice_count FROM clients c WHERE c.user_id=$1";const p=[req.user.id];if(search){q+=` AND (c.name ILIKE $${p.length+1} OR c.gstin ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}if(status){q+=` AND c.status=$${p.length+1}`;p.push(status);}q+=" ORDER BY c.name ASC";const r=await pool.query(q,p);res.json({success:true,clients:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
+  try{const{search,status,company_id}=req.query;let q="SELECT c.*,(SELECT COUNT(*) FROM notices n WHERE n.client_id=c.id AND n.status NOT IN ('closed','replied')) as notice_count FROM clients c WHERE c.user_id=$1";const p=[req.user.id];if(company_id){q+=` AND c.company_id=$${p.length+1}`;p.push(company_id);}if(search){q+=` AND (c.name ILIKE $${p.length+1} OR c.gstin ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}if(status){q+=` AND c.status=$${p.length+1}`;p.push(status);}q+=" ORDER BY c.name ASC";const r=await pool.query(q,p);res.json({success:true,clients:r.rows});}catch(e){res.status(500).json({success:false,message:e.message});}
 });
 app.post("/api/clients",auth,async(req,res)=>{
   try{const{name,gstin,state,type,turnover,notes,phone,email,address,city,pincode,pan}=req.body;if(!name)return res.status(400).json({success:false,message:"Name required"});const id=uuid();await pool.query("INSERT INTO clients (id,user_id,name,gstin,state,type,turnover,notes,phone,email,address,city,pincode,pan,company_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",[id,req.user.id,name,gstin?.toUpperCase()||null,state||null,type||"Trader",turnover||null,notes||null,phone||null,email||null,address||null,city||null,pincode||null,pan||null,company_id||null]);const r=await pool.query("SELECT * FROM clients WHERE id=$1",[id]);res.status(201).json({success:true,message:"Client added",client:r.rows[0]});}catch(e){res.status(500).json({success:false,message:e.message});}
@@ -1890,6 +1890,274 @@ app.get("/api/bank/reconcile/auto-match",auth,async(req,res)=>{
       }
     }
     res.json({success:true,message:`Auto-matched ${matched} transactions`,matched});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// V5: COMPANY-SCOPED PARTIES, PRODUCTS, INVOICES, GST FILING, AI SCANNER
+// ══════════════════════════════════════════════════════════════════════════
+
+// Setup new tables
+pool.query(`CREATE TABLE IF NOT EXISTS company_products (
+  id TEXT PRIMARY KEY, user_id TEXT, company_id TEXT,
+  name TEXT, hsn_sac TEXT, unit TEXT DEFAULT 'PCS', gst_rate REAL DEFAULT 18,
+  sale_price REAL DEFAULT 0, purchase_price REAL DEFAULT 0, stock_qty REAL DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+)`).catch(()=>{});
+
+pool.query(`CREATE TABLE IF NOT EXISTS company_invoices (
+  id TEXT PRIMARY KEY, user_id TEXT, company_id TEXT,
+  invoice_no TEXT, invoice_type TEXT, party_id TEXT, party_name TEXT,
+  invoice_date DATE, place_of_supply TEXT, is_igst BOOLEAN DEFAULT FALSE,
+  taxable_amount REAL DEFAULT 0, total_tax REAL DEFAULT 0, total_amount REAL DEFAULT 0,
+  paid_amount REAL DEFAULT 0, balance_due REAL DEFAULT 0, status TEXT DEFAULT 'unpaid',
+  voucher_id TEXT, items JSONB,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+)`).catch(()=>{});
+
+// ── PARTIES (= ledgers under Sundry Debtors/Creditors) ──
+app.get("/api/accounting/companies/:cid/parties",auth,async(req,res)=>{
+  try{
+    const{cid}=req.params;const{search}=req.query;
+    let q=`SELECT l.*,g.name as group_name,g.nature,
+      l.opening_balance + COALESCE((SELECT SUM(vi.dr_amount-vi.cr_amount) FROM voucher_items vi JOIN vouchers v ON vi.voucher_id=v.id WHERE vi.ledger_id=l.id AND v.is_cancelled=false),0) as raw_balance
+      FROM ledgers l JOIN ledger_groups g ON l.group_id=g.id
+      WHERE l.company_id=$1 AND l.user_id=$2 AND (g.name ILIKE '%Debtor%' OR g.name ILIKE '%Creditor%' OR g.name ILIKE '%Customer%' OR g.name ILIKE '%Supplier%')`;
+    const p=[cid,req.user.id];
+    if(search){q+=` AND l.name ILIKE $${p.length+1}`;p.push(`%${search}%`);}
+    q+=" ORDER BY l.name";
+    const r=await pool.query(q,p);
+    const parties=r.rows.map(row=>{
+      let bal=parseFloat(row.raw_balance||0);
+      const openType=row.opening_type||'Dr';
+      // raw_balance already includes opening adjusted by sign convention; normalize
+      const current_type=bal>=0?'Dr':'Cr';
+      return{...row,current_balance:Math.abs(bal),current_type};
+    });
+    res.json({success:true,parties});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post("/api/accounting/companies/:cid/parties",auth,async(req,res)=>{
+  try{
+    const{cid}=req.params;const uid=req.user.id;
+    const{name,type,gstin,state,address,phone,email,opening_balance,opening_type}=req.body;
+    if(!name)return res.status(400).json({success:false,message:"Name required"});
+    // Find appropriate group
+    const groupName=type==="Supplier"?"Sundry Creditors":"Sundry Debtors";
+    let grp=await pool.query("SELECT id FROM ledger_groups WHERE company_id=$1 AND user_id=$2 AND name=$3",[cid,uid,groupName]);
+    if(!grp.rows[0]){
+      const gid=uuid();
+      const nature=type==="Supplier"?"Liability":"Asset";
+      await pool.query("INSERT INTO ledger_groups (id,user_id,company_id,name,nature,affects_gross,is_default) VALUES ($1,$2,$3,$4,$5,false,false)",[gid,uid,cid,groupName,nature]);
+      grp={rows:[{id:gid}]};
+    }
+    const id=uuid();
+    await pool.query("INSERT INTO ledgers (id,user_id,company_id,group_id,name,opening_balance,opening_type,gstin,address,phone,email) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+      [id,uid,cid,grp.rows[0].id,name,parseFloat(opening_balance)||0,opening_type||"Dr",gstin||null,address||null,phone||null,email||null]);
+    res.json({success:true,id});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── PRODUCTS (company-scoped) ──
+app.get("/api/accounting/companies/:cid/products",auth,async(req,res)=>{
+  try{
+    const{cid}=req.params;const{search}=req.query;
+    let q="SELECT * FROM company_products WHERE company_id=$1 AND user_id=$2";
+    const p=[cid,req.user.id];
+    if(search){q+=` AND name ILIKE $${p.length+1}`;p.push(`%${search}%`);}
+    q+=" ORDER BY name";
+    const r=await pool.query(q,p);
+    res.json({success:true,products:r.rows});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post("/api/accounting/companies/:cid/products",auth,async(req,res)=>{
+  try{
+    const{cid}=req.params;const uid=req.user.id;
+    const{name,hsn_sac,unit,gst_rate,sale_price,purchase_price,stock_qty}=req.body;
+    if(!name)return res.status(400).json({success:false,message:"Name required"});
+    const id=uuid();
+    await pool.query("INSERT INTO company_products (id,user_id,company_id,name,hsn_sac,unit,gst_rate,sale_price,purchase_price,stock_qty) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+      [id,uid,cid,name,hsn_sac||null,unit||"PCS",parseFloat(gst_rate)||18,parseFloat(sale_price)||0,parseFloat(purchase_price)||0,parseFloat(stock_qty)||0]);
+    res.json({success:true,id});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.delete("/api/accounting/companies/:cid/products/:id",auth,async(req,res)=>{
+  try{await pool.query("DELETE FROM company_products WHERE id=$1 AND company_id=$2 AND user_id=$3",[req.params.id,req.params.cid,req.user.id]);res.json({success:true});}catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── INVOICES (company-scoped, posts voucher automatically) ──
+app.get("/api/accounting/companies/:cid/invoices/next-number",auth,async(req,res)=>{
+  try{
+    const{cid}=req.params;const{type}=req.query;
+    const prefix=type==="SALES"?"SALES":"PUR";
+    const r=await pool.query("SELECT COUNT(*) c FROM company_invoices WHERE company_id=$1 AND invoice_type=$2",[cid,type]);
+    const num=parseInt(r.rows[0].c)+1;
+    res.json({success:true,next_number:`${prefix}-${String(num).padStart(4,'0')}`});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get("/api/accounting/companies/:cid/invoices",auth,async(req,res)=>{
+  try{
+    const{cid}=req.params;const{type,search}=req.query;
+    let q="SELECT * FROM company_invoices WHERE company_id=$1 AND user_id=$2";
+    const p=[cid,req.user.id];
+    if(type){q+=` AND invoice_type=$${p.length+1}`;p.push(type);}
+    if(search){q+=` AND (party_name ILIKE $${p.length+1} OR invoice_no ILIKE $${p.length+2})`;p.push(`%${search}%`,`%${search}%`);}
+    q+=" ORDER BY invoice_date DESC, created_at DESC";
+    const r=await pool.query(q,p);
+    res.json({success:true,invoices:r.rows});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post("/api/accounting/companies/:cid/invoices",auth,async(req,res)=>{
+  try{
+    const{cid}=req.params;const uid=req.user.id;
+    const{party_id,invoice_no,invoice_date,invoice_type,is_igst,place_of_supply,items,total_amount,taxable_amount,total_tax}=req.body;
+    if(!party_id)return res.status(400).json({success:false,message:"Party required"});
+
+    const partyRow=await pool.query("SELECT name FROM ledgers WHERE id=$1 AND company_id=$2",[party_id,cid]);
+    const party_name=partyRow.rows[0]?.name||"Unknown";
+
+    // Find Sales/Purchase ledger + GST ledgers
+    const findLedger=async(name)=>{const r=await pool.query("SELECT id FROM ledgers WHERE company_id=$1 AND user_id=$2 AND name=$3",[cid,uid,name]);return r.rows[0]?.id;};
+    const salesPurchaseLedger=await findLedger(invoice_type==="SALES"?"Sales Account":"Purchase Account");
+    const cgstLedger=await findLedger(invoice_type==="SALES"?"Output CGST":"Input CGST");
+    const sgstLedger=await findLedger(invoice_type==="SALES"?"Output SGST":"Input SGST");
+    const igstLedger=await findLedger(invoice_type==="SALES"?"Output IGST":"Input IGST");
+
+    // Build voucher items
+    const vItems=[];
+    const half=total_tax/2;
+    if(invoice_type==="SALES"){
+      // Dr Party, Cr Sales, Cr GST
+      vItems.push({ledger_id:party_id,dr_amount:total_amount,cr_amount:0,narration:`Invoice ${invoice_no}`});
+      if(salesPurchaseLedger)vItems.push({ledger_id:salesPurchaseLedger,dr_amount:0,cr_amount:taxable_amount,narration:`Sales - ${invoice_no}`});
+      if(is_igst&&igstLedger)vItems.push({ledger_id:igstLedger,dr_amount:0,cr_amount:total_tax,narration:"IGST"});
+      else{
+        if(cgstLedger&&half>0)vItems.push({ledger_id:cgstLedger,dr_amount:0,cr_amount:half,narration:"CGST"});
+        if(sgstLedger&&half>0)vItems.push({ledger_id:sgstLedger,dr_amount:0,cr_amount:half,narration:"SGST"});
+      }
+    }else{
+      // Dr Purchase, Dr GST, Cr Party
+      if(salesPurchaseLedger)vItems.push({ledger_id:salesPurchaseLedger,dr_amount:taxable_amount,cr_amount:0,narration:`Purchase - ${invoice_no}`});
+      if(is_igst&&igstLedger)vItems.push({ledger_id:igstLedger,dr_amount:total_tax,cr_amount:0,narration:"IGST"});
+      else{
+        if(cgstLedger&&half>0)vItems.push({ledger_id:cgstLedger,dr_amount:half,cr_amount:0,narration:"CGST"});
+        if(sgstLedger&&half>0)vItems.push({ledger_id:sgstLedger,dr_amount:half,cr_amount:0,narration:"SGST"});
+      }
+      vItems.push({ledger_id:party_id,dr_amount:0,cr_amount:total_amount,narration:`Bill ${invoice_no}`});
+    }
+    // Filter out items with no ledger or zero amount
+    const validItems=vItems.filter(i=>i.ledger_id&&((i.dr_amount||0)>0||(i.cr_amount||0)>0));
+    if(validItems.length<2)return res.status(400).json({success:false,message:"Chart of Accounts missing Sales/Purchase/GST ledgers. Recreate company or add them manually."});
+
+    // Create voucher
+    const vId=uuid();const vNo=`${invoice_type}-${Date.now()}`;
+    await pool.query("INSERT INTO vouchers (id,user_id,company_id,voucher_no,voucher_type,date,narration,total_amount,party_name) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+      [vId,uid,cid,vNo,invoice_type,invoice_date,`${invoice_type==="SALES"?"Sales":"Purchase"} Invoice ${invoice_no}`,total_amount,party_name]);
+    for(let i=0;i<validItems.length;i++){
+      const it=validItems[i];
+      await pool.query("INSERT INTO voucher_items (id,voucher_id,ledger_id,ledger_name,dr_amount,cr_amount,narration,sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        [uuid(),vId,it.ledger_id,"",it.dr_amount||0,it.cr_amount||0,it.narration,i]);
+    }
+
+    // Save invoice record
+    const id=uuid();
+    await pool.query("INSERT INTO company_invoices (id,user_id,company_id,invoice_no,invoice_type,party_id,party_name,invoice_date,place_of_supply,is_igst,taxable_amount,total_tax,total_amount,balance_due,status,voucher_id,items) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'unpaid',$15,$16)",
+      [id,uid,cid,invoice_no,invoice_type,party_id,party_name,invoice_date,place_of_supply||null,is_igst||false,taxable_amount,total_tax,total_amount,total_amount,vId,JSON.stringify(items)]);
+
+    res.json({success:true,id,voucher_id:vId});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.delete("/api/accounting/companies/:cid/invoices/:id",auth,async(req,res)=>{
+  try{
+    const{cid,id}=req.params;
+    const inv=await pool.query("SELECT voucher_id FROM company_invoices WHERE id=$1 AND company_id=$2 AND user_id=$3",[id,cid,req.user.id]);
+    if(inv.rows[0]?.voucher_id){
+      await pool.query("DELETE FROM voucher_items WHERE voucher_id=$1",[inv.rows[0].voucher_id]);
+      await pool.query("DELETE FROM vouchers WHERE id=$1",[inv.rows[0].voucher_id]);
+    }
+    await pool.query("DELETE FROM company_invoices WHERE id=$1 AND company_id=$2 AND user_id=$3",[id,cid,req.user.id]);
+    res.json({success:true});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── GSTR-1 / GSTR-3B (company-scoped, from company_invoices) ──
+app.get("/api/accounting/companies/:cid/gstr1",auth,async(req,res)=>{
+  try{
+    const{cid}=req.params;const{period}=req.query; // MM-YYYY
+    const[mo,yr]=period.split("-");
+    const r=await pool.query(
+      `SELECT * FROM company_invoices WHERE company_id=$1 AND user_id=$2 AND invoice_type='SALES'
+       AND EXTRACT(MONTH FROM invoice_date)=$3 AND EXTRACT(YEAR FROM invoice_date)=$4`,
+      [cid,req.user.id,parseInt(mo),parseInt(yr)]);
+    const invs=r.rows;
+    const b2b=invs.filter(i=>i.party_name); // simplistic
+    let totalTaxable=0,totalIgst=0,totalCgst=0,totalSgst=0;
+    for(const inv of invs){
+      totalTaxable+=parseFloat(inv.taxable_amount||0);
+      if(inv.is_igst)totalIgst+=parseFloat(inv.total_tax||0);
+      else{totalCgst+=parseFloat(inv.total_tax||0)/2;totalSgst+=parseFloat(inv.total_tax||0)/2;}
+    }
+    res.json({success:true,period,b2b_count:invs.length,b2c_count:0,total_taxable:totalTaxable,total_igst:totalIgst,total_cgst:totalCgst,total_sgst:totalSgst,invoices:invs});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get("/api/accounting/companies/:cid/gstr3b",auth,async(req,res)=>{
+  try{
+    const{cid}=req.params;const{period}=req.query;
+    const[mo,yr]=period.split("-");
+    const sales=await pool.query(
+      `SELECT COALESCE(SUM(taxable_amount),0) tax,COALESCE(SUM(CASE WHEN is_igst THEN total_tax ELSE 0 END),0) igst,
+       COALESCE(SUM(CASE WHEN NOT is_igst THEN total_tax/2 ELSE 0 END),0) half
+       FROM company_invoices WHERE company_id=$1 AND user_id=$2 AND invoice_type='SALES' AND EXTRACT(MONTH FROM invoice_date)=$3 AND EXTRACT(YEAR FROM invoice_date)=$4`,
+      [cid,req.user.id,parseInt(mo),parseInt(yr)]);
+    const purchases=await pool.query(
+      `SELECT COALESCE(SUM(taxable_amount),0) tax,COALESCE(SUM(CASE WHEN is_igst THEN total_tax ELSE 0 END),0) igst,
+       COALESCE(SUM(CASE WHEN NOT is_igst THEN total_tax/2 ELSE 0 END),0) half
+       FROM company_invoices WHERE company_id=$1 AND user_id=$2 AND invoice_type='PURCHASE' AND EXTRACT(MONTH FROM invoice_date)=$3 AND EXTRACT(YEAR FROM invoice_date)=$4`,
+      [cid,req.user.id,parseInt(mo),parseInt(yr)]);
+    const s=sales.rows[0],p=purchases.rows[0];
+    res.json({success:true,period,
+      outward:{taxable:parseFloat(s.tax),igst:parseFloat(s.igst),cgst:parseFloat(s.half),sgst:parseFloat(s.half)},
+      inward:{taxable:parseFloat(p.tax),igst:parseFloat(p.igst),cgst:parseFloat(p.half),sgst:parseFloat(p.half)},
+      net_payable:{igst:Math.max(0,parseFloat(s.igst)-parseFloat(p.igst)),cgst:Math.max(0,parseFloat(s.half)-parseFloat(p.half)),sgst:Math.max(0,parseFloat(s.half)-parseFloat(p.half))}
+    });
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── AI INVOICE SCANNER ──
+app.post("/api/ai/scan-invoice",auth,upload.single("file"),async(req,res)=>{
+  try{
+    if(!req.file)return res.status(400).json({success:false,message:"File required"});
+    if(!process.env.GROQ_API_KEY)return res.status(400).json({success:false,message:"AI not configured"});
+    const Groq=require("groq-sdk");const groq=new Groq({apiKey:process.env.GROQ_API_KEY});
+    const base64=req.file.buffer.toString("base64");
+    const mime=req.file.mimetype;
+
+    if(!mime.startsWith("image/")){
+      return res.status(400).json({success:false,message:"Currently only image files supported for AI scan. Use PDF in Bank Statement instead."});
+    }
+
+    const completion=await groq.chat.completions.create({
+      model:"llama-3.2-11b-vision-preview",
+      messages:[{role:"user",content:[
+        {type:"text",text:`Extract invoice/bill details as JSON only (no markdown):
+{"type":"purchase or sales","vendor_name":"...","date":"YYYY-MM-DD","items":[{"description":"...","amount":0}],"total":0}
+Categorize each item's likely accounting ledger as one of: Purchase Account, Office Expenses, Travel Expenses, Stationery, Rent, Electricity, Telephone, Professional Fees, Repairs & Maintenance, Suspense Account. Add field "suggested_ledger" to each item.`},
+        {type:"image_url",image_url:{url:`data:${mime};base64,${base64}`}}
+      ]}],
+      temperature:0.1,max_tokens:1000
+    });
+    const reply=completion.choices[0]?.message?.content||"";
+    const jsonMatch=reply.match(/\{[\s\S]*\}/);
+    if(!jsonMatch)return res.status(400).json({success:false,message:"Could not extract data"});
+    const data=JSON.parse(jsonMatch[0]);
+    res.json({success:true,data});
   }catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
