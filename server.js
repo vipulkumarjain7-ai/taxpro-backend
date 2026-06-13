@@ -833,9 +833,8 @@ app.post("/api/bank/upload",auth,upload.single("file"),async(req,res)=>{
     // AI fallback when regex parser fails
     if(transactions.length===0&&process.env.GROQ_API_KEY){
       try{
-        const Groq=require("groq-sdk");const groq=new Groq({apiKey:process.env.GROQ_API_KEY});
         const sample=text.substring(0,3000);
-        const completion=await groq.chat.completions.create({
+        const reply=await groqChat({
           model:"llama3-8b-8192",
           messages:[{role:"user",content:`Extract bank transactions from this bank statement text. Return ONLY a JSON array like:
 [{"date":"YYYY-MM-DD","description":"narration text","debit":0,"credit":0,"balance":0}]
@@ -844,7 +843,6 @@ Bank Statement Text:
 ${sample}`}],
           temperature:0.1,max_tokens:2000
         });
-        const reply=completion.choices[0]?.message?.content||"";
         const jsonMatch=reply.match(/\[[\s\S]*\]/);
         if(jsonMatch){
           const aiTxns=JSON.parse(jsonMatch[0]);
@@ -2135,7 +2133,6 @@ app.post("/api/ai/scan-invoice",auth,upload.single("file"),async(req,res)=>{
   try{
     if(!req.file)return res.status(400).json({success:false,message:"File required"});
     if(!process.env.GROQ_API_KEY)return res.status(400).json({success:false,message:"AI not configured"});
-    const Groq=require("groq-sdk");const groq=new Groq({apiKey:process.env.GROQ_API_KEY});
     const base64=req.file.buffer.toString("base64");
     const mime=req.file.mimetype;
 
@@ -2143,7 +2140,7 @@ app.post("/api/ai/scan-invoice",auth,upload.single("file"),async(req,res)=>{
       return res.status(400).json({success:false,message:"Currently only image files supported for AI scan. Use PDF in Bank Statement instead."});
     }
 
-    const completion=await groq.chat.completions.create({
+    const reply=await groqChat({
       model:"llama-3.2-11b-vision-preview",
       messages:[{role:"user",content:[
         {type:"text",text:`Extract invoice/bill details as JSON only (no markdown):
@@ -2153,7 +2150,6 @@ Categorize each item's likely accounting ledger as one of: Purchase Account, Off
       ]}],
       temperature:0.1,max_tokens:1000
     });
-    const reply=completion.choices[0]?.message?.content||"";
     const jsonMatch=reply.match(/\{[\s\S]*\}/);
     if(!jsonMatch)return res.status(400).json({success:false,message:"Could not extract data"});
     const data=JSON.parse(jsonMatch[0]);
@@ -2269,9 +2265,8 @@ app.post("/api/accounting/companies/:cid/ai-chat",auth,async(req,res)=>{
   try{
     const{cid}=req.params;const{message}=req.body;
     if(!process.env.GROQ_API_KEY)return res.status(400).json({success:false,message:"AI not configured"});
-    const Groq=require("groq-sdk");const groq=new Groq({apiKey:process.env.GROQ_API_KEY});
     const company=await pool.query("SELECT name,gstin FROM companies WHERE id=$1",[cid]);
-    const completion=await groq.chat.completions.create({
+    const reply=await groqChat({
       model:"llama3-8b-8192",
       messages:[
         {role:"system",content:`You are a helpful Indian accounting & GST assistant for company "${company.rows[0]?.name}" (GSTIN: ${company.rows[0]?.gstin||"N/A"}). Answer concisely about GST, accounting, tax compliance, Tally entries etc.`},
@@ -2279,7 +2274,7 @@ app.post("/api/accounting/companies/:cid/ai-chat",auth,async(req,res)=>{
       ],
       temperature:0.4,max_tokens:600
     });
-    res.json({success:true,reply:completion.choices[0]?.message?.content||""});
+    res.json({success:true,reply});
   }catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -2295,4 +2290,16 @@ app.listen(PORT,()=>{
   console.log(`   Accounting: Companies | Groups | Ledgers | Vouchers`);
   console.log(`   Reports: Trial Balance | P&L | Balance Sheet | Day Book | Cash Book\n`);
 });
+
+// Groq API helper (avoids needing groq-sdk package)
+async function groqChat({model,messages,temperature=0.2,max_tokens=1000}){
+  const res=await fetch("https://api.groq.com/openai/v1/chat/completions",{
+    method:"POST",
+    headers:{"Content-Type":"application/json","Authorization":`Bearer ${process.env.GROQ_API_KEY}`},
+    body:JSON.stringify({model,messages,temperature,max_tokens})
+  });
+  const data=await res.json();
+  if(!res.ok)throw new Error(data.error?.message||"Groq API error");
+  return data.choices[0]?.message?.content||"";
+}
 module.exports=app;
