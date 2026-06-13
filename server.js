@@ -2141,7 +2141,7 @@ app.post("/api/ai/scan-invoice",auth,upload.single("file"),async(req,res)=>{
     }
 
     const reply=await groqChat({
-      model:"llama-3.2-11b-vision-preview",
+      model:"meta-llama/llama-4-scout-17b-16e-instruct",
       messages:[{role:"user",content:[
         {type:"text",text:`Extract invoice/bill details as JSON only (no markdown):
 {"type":"purchase or sales","vendor_name":"...","date":"YYYY-MM-DD","items":[{"description":"...","amount":0}],"total":0}
@@ -2290,6 +2290,7 @@ app.listen(PORT,()=>{
   console.log(`   Accounting: Companies | Groups | Ledgers | Vouchers`);
   console.log(`   Reports: Trial Balance | P&L | Balance Sheet | Day Book | Cash Book\n`);
 });
+module.exports=app;
 
 // Groq API helper (avoids needing groq-sdk package)
 async function groqChat({model,messages,temperature=0.2,max_tokens=1000}){
@@ -2302,4 +2303,3 @@ async function groqChat({model,messages,temperature=0.2,max_tokens=1000}){
   if(!res.ok)throw new Error(data.error?.message||"Groq API error");
   return data.choices[0]?.message?.content||"";
 }
-module.exports=app;
