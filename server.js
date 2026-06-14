@@ -2021,10 +2021,10 @@ app.post("/api/accounting/companies/:cid/invoices",auth,async(req,res)=>{
 
     // Find Sales/Purchase ledger + GST ledgers
     const findLedger=async(name)=>{const r=await pool.query("SELECT id FROM ledgers WHERE company_id=$1 AND user_id=$2 AND name=$3",[cid,uid,name]);return r.rows[0]?.id;};
-    const salesPurchaseLedger=await findLedger(invoice_type==="SALES"?"Sales Account":"Purchase Account");
-    const cgstLedger=await findLedger(invoice_type==="SALES"?"Output CGST":"Input CGST");
-    const sgstLedger=await findLedger(invoice_type==="SALES"?"Output SGST":"Input SGST");
-    const igstLedger=await findLedger(invoice_type==="SALES"?"Output IGST":"Input IGST");
+    const salesPurchaseLedger=await findLedger(invoice_type==="SALES"?"Sales":"Purchase");
+    const cgstLedger=await findLedger(invoice_type==="SALES"?"CGST Payable":"CGST Input Credit");
+    const sgstLedger=await findLedger(invoice_type==="SALES"?"SGST Payable":"SGST Input Credit");
+    const igstLedger=await findLedger(invoice_type==="SALES"?"IGST Payable":"IGST Input Credit");
 
     // Build voucher items
     const vItems=[];
@@ -2156,8 +2156,9 @@ app.post("/api/ai/scan-invoice",auth,upload.single("file"),async(req,res)=>{
   "igst_amount": 0,
   "total_amount": 0,
   "description": "brief description of goods/items e.g. Namkeen, Stationery etc",
-  "suggested_ledger": "Purchase Account"
+  "suggested_ledger": "Purchase"
 }
+For suggested_ledger, choose the most fitting from: Purchase, Salary & Wages, Rent, Electricity Charges, Freight & Cartage, Discount Allowed (for purchase-type invoices), or Sales, Discount Received, Commission Income (for sales-type invoices). Default to "Purchase" for purchase bills if unsure.
 IMPORTANT RULES:
 - taxable_amount = the base/subtotal amount BEFORE tax (often labeled "Total Amount" or subtotal before GST rows)
 - cgst_amount, sgst_amount, igst_amount = the actual tax amounts shown on separate lines (e.g. "SGST@2.5% = 1170" means sgst_amount is 1170)
