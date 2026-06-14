@@ -835,7 +835,7 @@ app.post("/api/bank/upload",auth,upload.single("file"),async(req,res)=>{
       try{
         const sample=text.substring(0,3000);
         const reply=await groqChat({
-          model:"llama3-8b-8192",
+          model:"llama-3.1-8b-instant",
           messages:[{role:"user",content:`Extract bank transactions from this bank statement text. Return ONLY a JSON array like:
 [{"date":"YYYY-MM-DD","description":"narration text","debit":0,"credit":0,"balance":0}]
 Rules: 1) date must be YYYY-MM-DD format 2) debit=withdrawal/payment 3) credit=deposit/receipt 4) omit header/footer rows 5) balance is closing balance after txn.
@@ -2143,15 +2143,34 @@ app.post("/api/ai/scan-invoice",auth,upload.single("file"),async(req,res)=>{
     const reply=await groqChat({
       model:"meta-llama/llama-4-scout-17b-16e-instruct",
       messages:[{role:"user",content:[
-        {type:"text",text:`Extract invoice/bill details as JSON only (no markdown):
-{"type":"purchase or sales","vendor_name":"...","date":"YYYY-MM-DD","items":[{"description":"...","amount":0}],"total":0}
-Categorize each item's likely accounting ledger as one of: Purchase Account, Office Expenses, Travel Expenses, Stationery, Rent, Electricity, Telephone, Professional Fees, Repairs & Maintenance, Suspense Account. Add field "suggested_ledger" to each item.`},
+        {type:"text",text:`You are reading a handwritten/printed Indian GST Tax Invoice. Extract ALL details carefully and return ONLY valid JSON (no markdown, no explanation) in this EXACT structure:
+{
+  "type": "purchase",
+  "vendor_name": "business/firm name printed at the top of the invoice (the seller, NOT the buyer)",
+  "vendor_gstin": "seller's GSTIN if visible",
+  "invoice_no": "invoice/bill number",
+  "invoice_date": "YYYY-MM-DD (convert from DD/MM/YY or DD-MM-YYYY format if needed)",
+  "taxable_amount": 0,
+  "cgst_amount": 0,
+  "sgst_amount": 0,
+  "igst_amount": 0,
+  "total_amount": 0,
+  "description": "brief description of goods/items e.g. Namkeen, Stationery etc",
+  "suggested_ledger": "Purchase Account"
+}
+IMPORTANT RULES:
+- taxable_amount = the base/subtotal amount BEFORE tax (often labeled "Total Amount" or subtotal before GST rows)
+- cgst_amount, sgst_amount, igst_amount = the actual tax amounts shown on separate lines (e.g. "SGST@2.5% = 1170" means sgst_amount is 1170)
+- total_amount = the GRAND TOTAL / final payable amount (taxable + all taxes)
+- vendor_name = the SELLER's business name (large heading at top), NOT the buyer/customer name
+- If a field is not visible/applicable, use 0 for numbers and "" for text
+- Double check: taxable_amount + cgst_amount + sgst_amount + igst_amount should approximately equal total_amount`},
         {type:"image_url",image_url:{url:`data:${mime};base64,${base64}`}}
       ]}],
       temperature:0.1,max_tokens:1000
     });
     const jsonMatch=reply.match(/\{[\s\S]*\}/);
-    if(!jsonMatch)return res.status(400).json({success:false,message:"Could not extract data"});
+    if(!jsonMatch)return res.status(400).json({success:false,message:"Could not extract data. Try a clearer image."});
     const data=JSON.parse(jsonMatch[0]);
     res.json({success:true,data});
   }catch(e){res.status(500).json({success:false,message:e.message});}
@@ -2267,7 +2286,7 @@ app.post("/api/accounting/companies/:cid/ai-chat",auth,async(req,res)=>{
     if(!process.env.GROQ_API_KEY)return res.status(400).json({success:false,message:"AI not configured"});
     const company=await pool.query("SELECT name,gstin FROM companies WHERE id=$1",[cid]);
     const reply=await groqChat({
-      model:"llama3-8b-8192",
+      model:"llama-3.1-8b-instant",
       messages:[
         {role:"system",content:`You are a helpful Indian accounting & GST assistant for company "${company.rows[0]?.name}" (GSTIN: ${company.rows[0]?.gstin||"N/A"}). Answer concisely about GST, accounting, tax compliance, Tally entries etc.`},
         {role:"user",content:message}
