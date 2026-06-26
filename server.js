@@ -3967,6 +3967,67 @@ app.post("/api/accounting/companies/:cid/gstr10/file",auth,async(req,res)=>{
   }catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+// ── Phone OTP Login — send OTP to email tied to that phone number ──
+app.post("/api/auth/phone-otp-request", rateLimiter({windowMs:15*60*1000,max:8,keyFn:req=>"phoneotp:"+req.ip}), async(req,res)=>{
+  try{
+    const{phone}=req.body;
+    if(!phone)return res.status(400).json({success:false,message:"Phone number required"});
+    const cleaned=String(phone).replace(/\D/g,"").slice(-10);
+    if(cleaned.length!==10)return res.status(400).json({success:false,message:"Enter a valid 10-digit mobile number"});
+    const r=await pool.query("SELECT * FROM users WHERE phone=$1",[cleaned]);
+    const user=r.rows[0];
+    if(!user)return res.status(404).json({success:false,message:"No account found with this mobile number. Please register first or check the number."});
+    if(user.is_suspended)return res.status(403).json({success:false,message:"This account has been suspended."});
+
+    const code=generateOTP();
+    const otpId=uuid();
+    await pool.query("INSERT INTO otp_codes (id,user_id,code,channel,purpose,expires_at) VALUES ($1,$2,$3,'email','phone_login',NOW()+interval '10 minutes')",
+      [otpId,user.id,code]);
+
+    let sent=false;
+    try{
+      await sendEmail({to:user.email,subject:"TaxPro GST — Phone Login OTP",
+        html:`<p>Hi ${user.name},</p><p>Your login OTP is <b style="font-size:22px;letter-spacing:4px">${code}</b></p><p>Valid for 10 minutes. Do not share this with anyone.</p>`});
+      sent=true;
+    }catch(e){}
+    if(!sent)return res.status(500).json({success:false,message:"Could not send OTP email. Please use email+password login instead."});
+
+    const tempToken=jwt.sign({uid:user.id,otp:otpId,purpose:"phone_login_otp"},JWT,{expiresIn:"10m"});
+    logAudit(user.id,"phone_otp_requested",`phone:${cleaned}`,req);
+    res.json({success:true,otp_token:tempToken,
+      sent_to:user.email.replace(/(.{2}).+(@.+)/,"$1***$2"),
+      message:`OTP sent to registered email ${user.email.replace(/(.{2}).+(@.+)/,"$1***$2")}`});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Verify Phone OTP (same verifier as 2FA, just different purpose tag) ──
+app.post("/api/auth/phone-otp-verify", rateLimiter({windowMs:15*60*1000,max:15,keyFn:req=>"phoneotp:"+req.ip}), async(req,res)=>{
+  try{
+    const{otp_token,code}=req.body;
+    if(!otp_token||!code)return res.status(400).json({success:false,message:"OTP token and code required"});
+    let payload;
+    try{payload=jwt.verify(otp_token,JWT);}catch(e){return res.status(401).json({success:false,message:"OTP session expired. Please try again."});}
+    if(!["phone_login_otp","login_otp"].includes(payload.purpose))return res.status(400).json({success:false,message:"Invalid OTP session"});
+    const otpRow=await pool.query("SELECT * FROM otp_codes WHERE id=$1 AND user_id=$2",[payload.otp,payload.uid]);
+    const otp=otpRow.rows[0];
+    if(!otp||otp.verified_at)return res.status(400).json({success:false,message:otp?.verified_at?"OTP already used":"OTP not found"});
+    if(new Date(otp.expires_at)<new Date())return res.status(400).json({success:false,message:"OTP expired. Please request again."});
+    if(otp.attempts>=5)return res.status(429).json({success:false,message:"Too many wrong attempts."});
+    if(otp.code!==String(code).trim()){
+      await pool.query("UPDATE otp_codes SET attempts=attempts+1 WHERE id=$1",[otp.id]);
+      return res.status(401).json({success:false,message:"Incorrect OTP. "+(4-otp.attempts)+" attempts remaining."});
+    }
+    await pool.query("UPDATE otp_codes SET verified_at=NOW() WHERE id=$1",[otp.id]);
+    const userRow=await pool.query("SELECT * FROM users WHERE id=$1",[payload.uid]);
+    const user=userRow.rows[0];
+    if(!user)return res.status(404).json({success:false,message:"User not found"});
+    const userObj={id:user.id,name:user.name,email:user.email,firm_name:user.firm_name,role:user.role};
+    const token=await issueSession(userObj,req);
+    logAudit(user.id,"phone_otp_login_success",null,req);
+    res.json({success:true,token,user:{...userObj,frn:user.frn}});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 app.use((req,res)=>res.status(404).json({success:false,message:`Route ${req.method} ${req.url} not found`}));
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({success:false,message:process.env.NODE_ENV==="production"?"Server error":err.message});});
 app.listen(PORT,()=>{
