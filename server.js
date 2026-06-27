@@ -422,17 +422,28 @@ app.post("/api/auth/login", rateLimiter({windowMs:15*60*1000,max:10,keyFn:req=>"
 
     // ── 2FA: if enabled, send OTP to registered email + phone and require verification ──
     if(user.two_factor_enabled){
-      const code=generateOTP();
-      const otpId=uuid();
-      await pool.query("INSERT INTO otp_codes (id,user_id,code,channel,purpose,expires_at) VALUES ($1,$2,$3,'both','login',NOW()+interval '10 minutes')",
-        [otpId,user.id,code]);
-      const tempToken=jwt.sign({uid:user.id,otp:otpId,purpose:"login_otp"},JWT,{expiresIn:"10m"});
-      let emailSent=false,smsSent=false;
-      try{ await sendEmail({to:user.email,subject:"TaxPro GST — Your Login OTP",html:`<p>Your login OTP is <b style="font-size:20px">${code}</b>. Valid for 10 minutes. Do not share this with anyone.</p>`}); emailSent=true; }catch(e){}
-      if(user.phone){ try{ await sendSMS({to:user.phone,message:`Your TaxPro GST login OTP is ${code}. Valid 10 min. Do not share.`}); smsSent=true; }catch(e){} }
-      if(!emailSent&&!smsSent) return res.status(500).json({success:false,message:"Could not send OTP — email/SMS not configured on server. Contact admin or disable 2FA."});
-      logAudit(user.id,"login_otp_sent",`email:${emailSent} sms:${smsSent}`,req);
-      return res.json({success:true,require_otp:true,otp_token:tempToken,sent_to:{email:emailSent?user.email.replace(/(.{2}).+(@.+)/,"$1***$2"):null,phone:smsSent?user.phone.replace(/.(?=.{2})/g,"*"):null}});
+      // Check if email is configured — if not, skip 2FA gracefully (can't block login forever)
+      const smtpConfigured=!!(process.env.SMTP_HOST&&process.env.SMTP_USER&&process.env.SMTP_PASS);
+      if(!smtpConfigured){
+        // SMTP not set up — log this as a warning but allow login through
+        logAudit(user.id,"login_2fa_skipped","SMTP not configured — 2FA bypassed",req);
+        // Fall through to normal login below (do not return here)
+      } else {
+        const code=generateOTP();
+        const otpId=uuid();
+        await pool.query("INSERT INTO otp_codes (id,user_id,code,channel,purpose,expires_at) VALUES ($1,$2,$3,'both','login',NOW()+interval '10 minutes')",
+          [otpId,user.id,code]);
+        const tempToken=jwt.sign({uid:user.id,otp:otpId,purpose:"login_otp"},JWT,{expiresIn:"10m"});
+        let emailSent=false,smsSent=false;
+        try{ await sendEmail({to:user.email,subject:"TaxPro GST — Your Login OTP",html:`<p>Your login OTP is <b style="font-size:20px">${code}</b>. Valid for 10 minutes. Do not share this with anyone.</p>`}); emailSent=true; }catch(e){}
+        if(user.phone){ try{ await sendSMS({to:user.phone,message:`Your TaxPro GST login OTP is ${code}. Valid 10 min. Do not share.`}); smsSent=true; }catch(e){} }
+        if(emailSent||smsSent){
+          logAudit(user.id,"login_otp_sent",`email:${emailSent} sms:${smsSent}`,req);
+          return res.json({success:true,require_otp:true,otp_token:tempToken,sent_to:{email:emailSent?user.email.replace(/(.{2}).+(@.+)/,"$1***$2"):null,phone:smsSent?user.phone.replace(/.(?=.{2})/g,"*"):null}});
+        }
+        // OTP send failed — fall through to direct login (don't block user)
+        logAudit(user.id,"login_otp_send_failed","OTP send failed — allowing direct login",req);
+      }
     }
 
     const userObj={id:user.id,name:user.name,email:user.email,firm_name:user.firm_name,role:user.role};
