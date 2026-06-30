@@ -2206,6 +2206,17 @@ app.put("/api/accounting/companies/:cid/invoices/:id",auth,async(req,res)=>{
   }catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+// Lightweight update — only balance_due/status, does NOT touch the voucher. Used when recording a payment/receipt.
+app.patch("/api/accounting/companies/:cid/invoices/:id/balance",auth,async(req,res)=>{
+  try{
+    const{cid,id}=req.params;const{balance_due,status}=req.body;
+    if(balance_due===undefined)return res.status(400).json({success:false,message:"balance_due required"});
+    await pool.query("UPDATE company_invoices SET balance_due=$1,status=$2 WHERE id=$3 AND company_id=$4 AND user_id=$5",
+      [parseFloat(balance_due),status||"unpaid",id,cid,req.user.id]);
+    res.json({success:true});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 app.delete("/api/accounting/companies/:cid/invoices/:id",auth,async(req,res)=>{
   try{
     const{cid,id}=req.params;
@@ -3656,37 +3667,38 @@ app.post("/api/notices/:id/generate-grounded-reply",auth,async(req,res)=>{
     if(!notice)return res.status(404).json({success:false,message:"Notice not found"});
 
     const searchText=`${notice.type} ${notice.description||""} ${notice.notice_text||""}`;
-    const matches=await searchLegalReferences(searchText,8);
+    const matches=await searchLegalReferences(searchText,15);
 
-    let referenceBlock="";
+    let referenceBlock='NO REFERENCES IN LIBRARY YET — Upload GST Act sections, Rules, Circulars and Case Law to Legal Library first.';
     if(matches.length>0){
-      referenceBlock=matches.map((r,i)=>`[REF-${i+1}] ${r.ref_type==="case_law"?`${r.title} (${r.court_name||""}, ${r.case_citation||""})`:`${r.act_name||""} ${r.reference_no||""} — ${r.title}`}\n${(r.full_text||"").substring(0,1200)}`).join("\n\n---\n\n");
+      referenceBlock=matches.map((r,i)=>{
+        const hdr=r.ref_type==='case_law'
+          ?`[REF-${i+1}] CASE LAW: ${r.title} | Court: ${r.court_name||'—'} | Citation: ${r.case_citation||'—'} | Date: ${r.case_date||'—'}`
+          :`[REF-${i+1}] ${r.ref_type.toUpperCase()}: ${r.act_name||''} ${r.reference_no||''} — ${r.title}`;
+        const textLen=i<4?2000:i<8?1000:500;
+        return`${hdr}\n${(r.full_text||'').substring(0,textLen)}`;
+      }).join('\n\n---\n\n');
     }
 
     const systemPrompt=matches.length>0
-      ? `You are drafting a formal reply to a GST notice on behalf of an Indian Chartered Accountant's client. You have been given a library of legal references below (Act sections, Rules, Circulars, or Case Law actually uploaded by the CA). 
+      ?`You are a senior Indian GST advocate and Chartered Accountant drafting a formal legal reply to a GST notice. You have ${matches.length} verified legal references from the CA's library.
 
-CRITICAL RULES — NEVER VIOLATE THESE:
-1. You may ONLY cite a reference if it appears in the "AVAILABLE REFERENCES" block below. Cite it using its exact [REF-n] tag plus its title/reference number.
-2. NEVER invent, guess, or recall from memory any section number, rule number, circular number, or case name/citation that is not explicitly given to you below. If you are not 100% certain a citation is in the provided list, do not use it.
-3. If the available references don't fully cover the issue, say so explicitly in the reply (e.g. "no directly applicable precedent was found in the reference library for this specific issue") rather than filling the gap with an invented citation.
-4. Write in formal legal/professional Indian GST correspondence style, addressed to the relevant GST officer, structured with: Subject, reference to notice, point-wise rebuttal/explanation citing the references where relevant, and a concluding prayer/request.
+MANDATORY RULES — ENFORCE STRICTLY:
+1. CITE AS MANY REFERENCES AS POSSIBLE from the list below. A strong reply cites minimum 5-8 references. Do not leave useful references unused.
+2. For EVERY legal point, immediately cite the reference: 'As per [REF-n] (Section X / Circular No. Y / case name)...'
+3. NEVER cite any section, rule, circular, or case NOT explicitly listed in AVAILABLE REFERENCES below. Not even one.
+4. Structure: (a) Header & Subject, (b) Reference to notice, (c) Preliminary objections with citations, (d) Point-wise rebuttal with [REF-n] for every point, (e) Settled law / precedents from library, (f) Prayer & relief sought.
+5. If a case law ref is in the library, quote its key holding in the reply.
+6. Write in formal Indian legal style (To: The Proper Officer; Subject:; Respected Sir/Madam;).
 
-AVAILABLE REFERENCES (cite ONLY from these):\n${referenceBlock}`
-      : `You are drafting a formal reply to a GST notice. No matching legal references were found in the CA's reference library for this notice's topic.
-CRITICAL: Do NOT cite any specific section number, rule number, circular, or case law from memory — you have no verified references for this notice. Write a general, professionally-worded reply addressing the notice on factual/procedural grounds only (e.g. requesting more time, stating facts, requesting personal hearing), and explicitly note at the end: "No specific case law or circular references were available in the reference library for this notice — recommend the CA add relevant Act sections, rules, or precedents before finalizing, and have this draft reviewed by a qualified professional before submission."`;
+AVAILABLE REFERENCES (${matches.length} total — use ALL relevant ones):\n\n${referenceBlock}`
+      :`You are drafting a formal reply to a GST notice. The CA's legal library is EMPTY — no references have been uploaded yet.
+CRITICAL: Do NOT cite any section number, rule, circular or case from memory.
+Write a professional procedural reply only. End with: 'NOTE TO CA: The Legal Library is empty. Please upload relevant GST Act sections (e.g. Section 73, 74, 16, Rule 142), CBIC Circulars and court orders for a fully-cited reply.'`;
 
-    const userPrompt=`Notice details:
-Client: ${notice.client_name} (GSTIN: ${notice.gstin})
-Notice Type: ${notice.type}
-Reference No: ${notice.ref_no}
-Amount: ₹${notice.amount}
-Description/Issue: ${notice.description||"Not provided"}
-${notice.notice_text?`\nFull notice text (extracted):\n${notice.notice_text.substring(0,3000)}`:""}
+    const userPrompt=`Notice Details:\nClient: ${notice.client_name||'Taxpayer'} | GSTIN: ${notice.gstin||'—'}\nNotice Type: ${notice.type}\nRef No: ${notice.ref_no}\nDemand: Rs ${notice.amount||0}\nIssue: ${notice.description||'Not provided'}\n${notice.notice_text?`\nExtracted Notice Text:\n${notice.notice_text.substring(0,3000)}`:''}`;
 
-Draft the formal reply now.`;
-
-    const reply=await groqChat({model:"llama-3.1-8b-instant",messages:[{role:"system",content:systemPrompt},{role:"user",content:userPrompt}],temperature:0.2,max_tokens:1800});
+    const reply=await groqChat({model:'llama-3.1-8b-instant',messages:[{role:'system',content:systemPrompt},{role:'user',content:userPrompt}],temperature:0.15,max_tokens:2500});
 
     const referencesUsed=matches.map(m=>({id:m.id,ref_type:m.ref_type,title:m.title,reference_no:m.reference_no,act_name:m.act_name,court_name:m.court_name,case_citation:m.case_citation}));
     await pool.query("UPDATE notices SET ai_reply_draft=$1,references_used=$2 WHERE id=$3",[reply,JSON.stringify(referencesUsed),id]);
