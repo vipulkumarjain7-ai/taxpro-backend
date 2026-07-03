@@ -4051,6 +4051,322 @@ app.post("/api/auth/phone-otp-verify", rateLimiter({windowMs:15*60*1000,max:15,k
   }catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+// ══════════════════════════════════════════════════════════════════════════
+// GSTAT / APPELLATE AUTHORITY APPEAL DRAFTING (grounded in Legal Library only)
+// ══════════════════════════════════════════════════════════════════════════
+pool.query(`CREATE TABLE IF NOT EXISTS appeals (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, company_id TEXT,
+  appeal_to TEXT DEFAULT 'GSTAT', -- 'GSTAT' | 'Appellate Authority (Commissioner Appeals)'
+  order_ref_no TEXT, order_date DATE, order_type TEXT, -- e.g. 'Order-in-Original (DRC-07)'
+  section_invoked TEXT, demand_amount REAL DEFAULT 0,
+  tax_period TEXT, issuing_officer TEXT, jurisdiction TEXT,
+  order_text TEXT, -- extracted text of the impugned order
+  facts_summary TEXT,
+  grounds JSONB DEFAULT '[]', -- [{ground_no, heading, text, references:[{ref_id,...}]}]
+  delay_days INTEGER DEFAULT 0, condonation_reason TEXT,
+  prayer TEXT,
+  annexures JSONB DEFAULT '[]', -- [{label, description}]
+  risk_analysis JSONB DEFAULT '{}', -- {strong:[], weak:[], missing_docs:[]}
+  ai_draft TEXT, references_used JSONB DEFAULT '[]',
+  status TEXT DEFAULT 'draft', -- draft | reviewed | filed
+  created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+)`).catch(()=>{});
+pool.query(`CREATE INDEX IF NOT EXISTS idx_appeals_user ON appeals(user_id)`).catch(()=>{});
+
+// ── Appeal CRUD ───────────────────────────────────────────────────────────────
+app.get("/api/appeals",auth,async(req,res)=>{
+  try{
+    const{company_id,status}=req.query;
+    let q="SELECT id,appeal_to,order_ref_no,order_date,order_type,section_invoked,demand_amount,tax_period,status,created_at FROM appeals WHERE user_id=$1";
+    const p=[req.user.id];
+    if(company_id){q+=` AND company_id=$${p.length+1}`;p.push(company_id);}
+    if(status){q+=` AND status=$${p.length+1}`;p.push(status);}
+    q+=" ORDER BY created_at DESC";
+    const r=await pool.query(q,p);
+    res.json({success:true,appeals:r.rows});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get("/api/appeals/:id",auth,async(req,res)=>{
+  try{
+    const r=await pool.query("SELECT * FROM appeals WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);
+    if(!r.rows[0])return res.status(404).json({success:false,message:"Appeal not found"});
+    res.json({success:true,appeal:r.rows[0]});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post("/api/appeals",auth,async(req,res)=>{
+  try{
+    const d=req.body;
+    const id=uuid();
+    await pool.query(`INSERT INTO appeals
+      (id,user_id,company_id,appeal_to,order_ref_no,order_date,order_type,section_invoked,
+       demand_amount,tax_period,issuing_officer,jurisdiction,facts_summary,delay_days,
+       condonation_reason,prayer,annexures,grounds)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+      [id,req.user.id,d.company_id||null,d.appeal_to||"GSTAT",
+       d.order_ref_no||null,d.order_date||null,d.order_type||null,d.section_invoked||null,
+       parseFloat(d.demand_amount)||0,d.tax_period||null,d.issuing_officer||null,d.jurisdiction||null,
+       d.facts_summary||null,parseInt(d.delay_days)||0,d.condonation_reason||null,
+       d.prayer||null,JSON.stringify(d.annexures||[]),JSON.stringify(d.grounds||[])]);
+    const saved=await pool.query("SELECT * FROM appeals WHERE id=$1",[id]);
+    res.status(201).json({success:true,appeal:saved.rows[0]});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put("/api/appeals/:id",auth,async(req,res)=>{
+  try{
+    const d=req.body;
+    await pool.query(`UPDATE appeals SET
+      appeal_to=$1,order_ref_no=$2,order_date=$3,order_type=$4,section_invoked=$5,
+      demand_amount=$6,tax_period=$7,issuing_officer=$8,jurisdiction=$9,
+      facts_summary=$10,delay_days=$11,condonation_reason=$12,prayer=$13,
+      annexures=$14,grounds=$15,status=$16,updated_at=NOW()
+      WHERE id=$17 AND user_id=$18`,
+      [d.appeal_to||"GSTAT",d.order_ref_no||null,d.order_date||null,d.order_type||null,
+       d.section_invoked||null,parseFloat(d.demand_amount)||0,d.tax_period||null,
+       d.issuing_officer||null,d.jurisdiction||null,d.facts_summary||null,
+       parseInt(d.delay_days)||0,d.condonation_reason||null,d.prayer||null,
+       JSON.stringify(d.annexures||[]),JSON.stringify(d.grounds||[]),d.status||"draft",
+       req.params.id,req.user.id]);
+    res.json({success:true,message:"✅ Appeal saved"});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.delete("/api/appeals/:id",auth,async(req,res)=>{
+  try{await pool.query("DELETE FROM appeals WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);res.json({success:true});}
+  catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Step 1: Upload impugned order → OCR + AI structured extraction ─────────────
+app.post("/api/appeals/:id/scan-order",auth,upload.single("file"),async(req,res)=>{
+  try{
+    if(!req.file)return res.status(400).json({success:false,message:"File required"});
+    let extractedText="";
+    if(req.file.mimetype==="application/pdf"){
+      try{const pp=require("pdf-parse");const data=await pp(req.file.buffer);extractedText=data.text;}catch(e){}
+    }
+    let aiSummary=null;
+    const textForAI=extractedText?.trim().length>20?extractedText.substring(0,5000):"";
+    if(textForAI||req.file.mimetype.startsWith("image/")){
+      const messages=req.file.mimetype.startsWith("image/")?[{role:"user",content:[
+        {type:"text",text:`This is a GST demand order or SCN. Extract ALL visible details and return ONLY JSON with these fields:
+{"gstin":"","taxpayer_name":"","order_ref_no":"","order_date":"YYYY-MM-DD","order_type":"e.g. Order-in-Original / DRC-07 / SCN","section_invoked":"e.g. Section 73 of CGST Act 2017","tax_period":"e.g. 2021-22","demand_amount":0,"issuing_officer":"","jurisdiction":"","grounds_of_demand":["point1","point2"],"full_text":"all visible text"}`},
+        {type:"image_url",image_url:{url:`data:${req.file.mimetype};base64,${req.file.buffer.toString("base64")}`}}
+      ]}]:[{role:"system",content:`Extract structured details from this GST order text. Return ONLY JSON:
+{"gstin":"","taxpayer_name":"","order_ref_no":"","order_date":"YYYY-MM-DD","order_type":"","section_invoked":"","tax_period":"","demand_amount":0,"issuing_officer":"","jurisdiction":"","grounds_of_demand":["point1"],"full_text":""}`},
+      {role:"user",content:textForAI}];
+      const reply=await groqChat({model:"llama-3.1-8b-instant",messages,temperature:0.05,max_tokens:1200});
+      const m=reply.match(/\{[\s\S]*\}/);
+      if(m)try{aiSummary=JSON.parse(m[0]);if(aiSummary.full_text)extractedText=aiSummary.full_text;}catch(e){}
+    }
+    // Save order text to appeal record
+    await pool.query("UPDATE appeals SET order_text=$1,updated_at=NOW() WHERE id=$2 AND user_id=$3",
+      [extractedText||"",req.params.id,req.user.id]);
+    res.json({success:true,extracted_text:extractedText,summary:aiSummary});
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Step 2: AI generates full appeal draft grounded in Legal Library ───────────
+app.post("/api/appeals/:id/generate-draft",auth,async(req,res)=>{
+  try{
+    const r=await pool.query("SELECT * FROM appeals WHERE id=$1 AND user_id=$2",[req.params.id,req.user.id]);
+    const appeal=r.rows[0];
+    if(!appeal)return res.status(404).json({success:false,message:"Appeal not found"});
+
+    // Build a rich search query from all available appeal details
+    const searchText=[
+      appeal.section_invoked||"",appeal.order_type||"",appeal.facts_summary||"",
+      (appeal.grounds||[]).map(g=>g.heading||g.text||"").join(" "),
+      appeal.order_text?.substring(0,500)||""
+    ].join(" ");
+
+    // Search maximum references from global Legal Library
+    const matches=await searchLegalReferences(searchText,20);
+
+    // Build reference block — detailed for first 8, summary for rest
+    let refBlock="⚠ Legal Library is EMPTY. No references to cite. Upload GST Act sections, rules, circulars and court orders in the Legal Library first.";
+    if(matches.length>0){
+      refBlock=`TOTAL REFERENCES AVAILABLE: ${matches.length}\n\n`+matches.map((r,i)=>{
+        const isCase=r.ref_type==="case_law";
+        const header=isCase
+          ?`[REF-${i+1}] 📋 CASE LAW\nTitle: ${r.title}\nCourt: ${r.court_name||"—"}\nCitation: ${r.case_citation||"—"}\nDate: ${r.case_date||"—"}`
+          :`[REF-${i+1}] 📖 ${r.ref_type.toUpperCase()}\nAct/Source: ${r.act_name||"—"}\nReference: ${r.reference_no||"—"}\nTitle: ${r.title}`;
+        const textLen=i<5?2500:i<10?1500:600;
+        return`${header}\n---\n${(r.full_text||"").substring(0,textLen)}`;
+      }).join("\n\n════════════════════════════════\n\n");
+    }
+
+    const companyRow=await pool.query("SELECT * FROM companies WHERE id=$1",[appeal.company_id]).catch(()=>({rows:[]}));
+    const co=companyRow.rows[0]||{};
+    const grounds=Array.isArray(appeal.grounds)?appeal.grounds:[];
+
+    const systemPrompt=`You are India's most experienced GST Advocate drafting a formal appeal before the ${appeal.appeal_to||"GST Appellate Authority"}.
+
+ABSOLUTE RULES — VIOLATION IS PROHIBITED:
+1. CITE ONLY from the LEGAL REFERENCES provided below. NEVER cite any section, rule, circular, judgment, or GSTAT order from your training memory.
+2. For EVERY ground of appeal, cite MINIMUM 3-5 references from the library using [REF-n] tags.
+3. For case law, always quote the relevant holding/observation (the key legal principle from that case).
+4. Structure EXACTLY as follows:
+   BEFORE THE GST APPELLATE TRIBUNAL / APPELLATE AUTHORITY
+   IN THE MATTER OF: [Taxpayer] vs. [Department]
+   APPEAL NO.: __________
+   
+   MEMORANDUM OF APPEAL
+   
+   PART A — BASIC FACTS
+   PART B — STATEMENT OF FACTS (detailed, chronological)
+   PART C — GROUNDS OF APPEAL (numbered, each with citations)
+   PART D — CONDONATION OF DELAY (if delay_days > 0)
+   PART E — PRAYER (relief sought)
+   PART F — LIST OF DOCUMENTS / ANNEXURES
+   VERIFICATION CLAUSE
+
+5. Each Ground must follow this sub-structure:
+   Ground No. [n]: [Heading]
+   [Detailed legal argument]
+   Reference: [REF-n] — [specific paragraph/sub-section]
+   Decided cases: [REF-n], [REF-n]
+   
+6. Risk Analysis section must be added at the END (for CA's internal use):
+   INTERNAL RISK ANALYSIS (NOT FOR FILING):
+   ✅ STRONG GROUNDS: ...
+   ⚠ GROUNDS NEEDING SUPPORTING DOCS: ...
+   ❌ WEAK GROUNDS: ...
+
+${matches.length===0?"WARNING: No references in library. Write procedural/factual appeal only and explicitly note that library references are needed for a fully-cited appeal.":""}
+
+LEGAL REFERENCES FROM CA'S LIBRARY (${matches.length} total — USE MAXIMUM):
+${refBlock}`;
+
+    const groundsText=grounds.length>0
+      ?`Grounds raised by CA:\n${grounds.map((g,i)=>`${i+1}. ${g.heading||""}: ${g.text||""}`).join("\n")}`
+      :"No specific grounds provided by CA — AI should identify grounds from the order text.";
+
+    const userPrompt=`Draft a complete formal appeal with the following details:
+
+APPEAL DETAILS:
+Forum: ${appeal.appeal_to||"GSTAT"}
+Taxpayer: ${co.name||"Taxpayer"} (GSTIN: ${co.gstin||appeal.gstin||"—"})
+Order Reference: ${appeal.order_ref_no||"—"} dated ${appeal.order_date||"—"}
+Order Type: ${appeal.order_type||"—"}
+Section(s) Invoked: ${appeal.section_invoked||"—"}
+Tax Period: ${appeal.tax_period||"—"}
+Demand Amount: ₹${(parseFloat(appeal.demand_amount)||0).toLocaleString("en-IN")}
+Issuing Authority: ${appeal.issuing_officer||"—"}, ${appeal.jurisdiction||"—"}
+Delay in Filing: ${appeal.delay_days||0} days${appeal.condonation_reason?` (Reason: ${appeal.condonation_reason})`:""}
+
+FACTS SUMMARY:
+${appeal.facts_summary||"Extract from order text below."}
+
+${groundsText}
+
+IMPUGNED ORDER TEXT (extracted):
+${(appeal.order_text||"").substring(0,2500)}
+
+PRAYER REQUESTED:
+${appeal.prayer||"Set aside the impugned order and grant full relief."}
+
+ANNEXURES PLANNED:
+${(appeal.annexures||[]).map((a,i)=>`${i+1}. ${a.label}: ${a.description}`).join("\n")||"List to be added by CA"}
+
+Now draft the complete formal appeal. Use [REF-n] citations extensively. EVERY legal ground must have citations.`;
+
+    const draft=await groqChat({
+      model:"llama-3.1-8b-instant",
+      messages:[{role:"system",content:systemPrompt},{role:"user",content:userPrompt}],
+      temperature:0.1,max_tokens:3500
+    });
+
+    const refsUsed=matches.map(m=>({
+      ref_id:m.id,ref_type:m.ref_type,title:m.title,
+      act_name:m.act_name,reference_no:m.reference_no,
+      court_name:m.court_name,case_citation:m.case_citation,
+      score:m.score
+    }));
+
+    // Risk analysis extraction from the draft
+    const riskMatch=draft.match(/INTERNAL RISK ANALYSIS[\s\S]{0,2000}/i);
+    const riskText=riskMatch?riskMatch[0]:"";
+
+    await pool.query(
+      "UPDATE appeals SET ai_draft=$1,references_used=$2,risk_analysis=$3,updated_at=NOW() WHERE id=$4",
+      [draft,JSON.stringify(refsUsed),JSON.stringify({raw:riskText,ref_count:matches.length}),req.params.id]
+    );
+
+    res.json({
+      success:true,draft,references_used:refsUsed,
+      grounded:matches.length>0,ref_count:matches.length,
+      disclaimer:"This is an AI-assisted draft grounded in your Legal Library. Have it reviewed by a qualified advocate/CA before filing with GSTAT or Appellate Authority."
+    });
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Download appeal draft as Word document ───────────────────────────────────
+app.get("/api/appeals/:id/download",auth,async(req,res)=>{
+  try{
+    const r=await pool.query("SELECT a.*,c.name as co_name,c.gstin as co_gstin FROM appeals a LEFT JOIN companies c ON a.company_id=c.id WHERE a.id=$1 AND a.user_id=$2",[req.params.id,req.user.id]);
+    const appeal=r.rows[0];
+    if(!appeal)return res.status(404).json({success:false,message:"Not found"});
+    if(!appeal.ai_draft)return res.status(400).json({success:false,message:"Generate the appeal draft first"});
+
+    const refs=typeof appeal.references_used==="string"?JSON.parse(appeal.references_used||"[]"):appeal.references_used||[];
+    const draftHtml=appeal.ai_draft.split(/\n\n+/).map(p=>
+      `<p style="margin:0 0 10px;text-align:justify;font-size:11pt;">${p.replace(/\n/g,"<br/>")}</p>`
+    ).join("");
+
+    const refsHtml=refs.length>0?`
+      <div style="page-break-before:always;margin-top:40px;">
+      <h2 style="text-align:center;font-size:13pt;">LEGAL REFERENCES CITED</h2>
+      <table border="1" style="width:100%;border-collapse:collapse;font-size:10pt;">
+        <tr style="background:#f0f0f0;"><th style="padding:6px;">Ref</th><th>Type</th><th>Reference</th><th>Title</th></tr>
+        ${refs.map((rf,i)=>`<tr><td style="padding:5px;text-align:center;">[REF-${i+1}]</td>
+          <td style="padding:5px;">${rf.ref_type==="case_law"?"Case Law":(rf.ref_type||"").replace("_"," ")}</td>
+          <td style="padding:5px;">${rf.ref_type==="case_law"?`${rf.case_citation||""} (${rf.court_name||""})`:
+            `${rf.act_name||""} ${rf.reference_no||""}`}</td>
+          <td style="padding:5px;">${rf.title||""}</td></tr>`).join("")}
+      </table></div>`:"";
+
+    const html=`<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word'>
+<head><meta charset="UTF-8"><title>Appeal ${appeal.order_ref_no||""}</title>
+<style>
+  body{font-family:"Times New Roman",serif;font-size:11pt;margin:60px;color:#000;line-height:1.6}
+  h1,h2,h3{font-family:"Times New Roman",serif}
+  .header{text-align:center;border:2px solid #000;padding:12px;margin-bottom:20px}
+  .party{text-align:center;margin:12px 0;font-size:12pt}
+  .vs{text-align:center;font-style:italic;margin:6px 0}
+</style></head><body>
+<div class="header">
+  <b style="font-size:14pt;">BEFORE THE ${(appeal.appeal_to||"GST APPELLATE AUTHORITY").toUpperCase()}</b><br/>
+  <span style="font-size:11pt;">APPEAL AGAINST ORDER NO. ${appeal.order_ref_no||"__________"} DATED ${appeal.order_date||"__________"}</span>
+</div>
+<div class="party"><b>${appeal.co_name||"[Taxpayer Name]"}</b><br/><span style="font-size:10pt;">GSTIN: ${appeal.co_gstin||"__________"} | ${appeal.jurisdiction||"__________"}</span></div>
+<div class="vs">— Appellant —<br/>VERSUS<br/>— The Respondent (GST Department) —</div>
+<p style="text-align:center;margin:12px 0;"><b>MEMORANDUM OF APPEAL</b></p>
+<p><b>Demand Amount in Dispute:</b> ₹${(parseFloat(appeal.demand_amount)||0).toLocaleString("en-IN")}</p>
+<p><b>Tax Period:</b> ${appeal.tax_period||"—"}</p>
+<p><b>Section(s) Invoked:</b> ${appeal.section_invoked||"—"}</p>
+<hr/>
+${draftHtml}
+${refsHtml}
+<div style="margin-top:60px;page-break-before:always;">
+<p>VERIFICATION</p>
+<p>I, the authorised signatory of the Appellant, do hereby verify that the facts stated in this Memorandum of Appeal are true and correct to the best of my knowledge and belief. Nothing has been concealed or misrepresented.</p>
+<br/><br/>
+<p>Date: _____________ &nbsp;&nbsp;&nbsp; Place: _____________</p>
+<p>Signature: _____________</p>
+<p>Name: _____________</p>
+<p>Designation: _____________</p>
+</div>
+<p style="font-size:8pt;color:#666;margin-top:40px;">AI-assisted draft — prepared using Legal Library references only. Must be reviewed by a qualified advocate/CA before filing. Generated by TaxPro GST.</p>
+</body></html>`;
+
+    res.setHeader("Content-Type","application/msword");
+    res.setHeader("Content-Disposition",`attachment; filename="Appeal_${(appeal.order_ref_no||"draft").replace(/[^a-zA-Z0-9]/g,"_")}.doc"`);
+    res.send(html);
+  }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 app.use((req,res)=>res.status(404).json({success:false,message:`Route ${req.method} ${req.url} not found`}));
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({success:false,message:process.env.NODE_ENV==="production"?"Server error":err.message});});
 app.listen(PORT,()=>{
